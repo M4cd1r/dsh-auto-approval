@@ -3,13 +3,12 @@
  *
  * The Typert strict codec only needs `{ parse(value) }` (`TypertSchema` in
  * `@deepseek-ai/dsh-typert-protocol`), so the browser bundle validates with
- * these tiny parsers instead of bundling zod. Zod's feature detection calls
- * `new Function("")`, which both bloats the client bundle (~150 kB) and trips
+ * these tiny parsers instead of bundling zod: zod's feature detection uses the
+ * Function constructor, which both bloats the client bundle (~150 kB) and trips
  * static "dynamic code execution" scanners on published plugin sources.
  *
- * The shapes MUST stay in lockstep with the host service
- * (`packages/dsh-auto-approval/src/remote.ts`) and its strict manifest
- * (`packages/dsh-auto-approval/src/remote-manifest.ts`).
+ * The shapes MUST stay in lockstep with the host service (`src/remote.ts`) and
+ * its strict manifest (`src/remote-manifest.ts`).
  */
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 
