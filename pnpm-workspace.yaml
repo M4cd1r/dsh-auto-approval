@@ -1,10 +1,9 @@
-# dsh-auto-approval monorepo：host 半（dsh-auto-approval）+ client 伴侣半
-# （dsh-client-ui-auto-approval）两个包同仓。@deepseek-ai/* 的 peer 指向
-# dsh 本体提供的包，peer 不自动安装；devDeps 钉在实测过的官方版本。
+# 单包仓库：host 半 + browser 半同包（dsh.bundle.patch + dsh.client）。
+# @deepseek-ai/* 的 peer 由 dsh 本体提供，peer 不自动安装；devDeps 钉在
+# 实测过的官方版本。
 packages:
-  - packages/*
+  - .
 autoInstallPeers: false
-# 官方包按发版节奏同步（rc 版常在数天内更新），不参与 release-age 冷却。
 minimumReleaseAgeExclude:
   - '@deepseek-ai/*'
 strictPeerDependencies: false

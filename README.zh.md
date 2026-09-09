@@ -2,47 +2,117 @@
 
 [English](README.md) | [中文](README.zh.md)
 
-> ⚠️ **已弃用 —— 请用 [dsh-automode](https://github.com/Andy8647/dsh-automode)。**
->
-> 本插件只挂 `tools/pre-execute`；DSH 自己的审批通道（尤其是沙箱升级）是另一条路，所以照样会弹给用户——“AA on” 从来不等于无人值守。`dsh-automode` 把同一套分类器重做成**第四档权限 preset**（完全权限 + 审批 `never`，完全不弹窗），前后端合成一个包。
->
-> npm 上的 `dsh-auto-approval` 与 `dsh-client-ui-auto-approval` 已弃用，改用 `dsh-automode`。
+给 DeepSeek Harness 加**第四档权限**：在输入栏的权限下拉里选 **Automode**，会话就以完全权限运行，唯一的安全闸门是一个 LLM 分类器——它替你回答每一次判定，**不再弹审批**。
 
-DSH 权限自动审批插件 —— 给 approval policy 加第三档 `auto`，classifier 对每个 tool call 做 **allow / deny** 两态决策（全托管，不转人工）。
+权限模型保持 3 + 1：官方三档沙箱，外加一档全托管。选其它 preset 即等于关掉本插件，没有第二个开关。
 
-## Demo
+> **0.2.0 是对 0.1.x 的重写。** 开关从插件设置改成了权限 preset：装好、选 **Automode**，就完事。升级见 [从 0.1.x 升级](#从-01x-升级)。
 
-![auto-approval 两态决策演示](https://raw.githubusercontent.com/Andy8647/dsh-auto-approval/main/docs/demo.gif)
+## 演示
 
-输入栏旁的 **chip** 显示运行状态（`AA on`/`AA off`），悬停看累计统计，点击弹窗：开关（Switch）、配置摘要、决策历史表格。演示覆盖：文件读写 / `ls` 白名单直接放行、无害命令 L1 classifier 放行、deny 规则 / ask 规则（全托管即拒）/ 自毁护栏拒绝危险命令。
+![Automode：多步任务无人值守跑完，被拒的调用出现在决策表里](docs/demo.gif)
 
-这是一个 monorepo，两个包：
+录屏内容：选 **Automode**，发一条 prompt（建目录 → 写文件 → 读回确认 → 执行 `echo danger_test`）。文件那几步全程无人值守通过（`L1-deep` / `whitelist`），最后那条命令被硬规则拦下（`L0-deny`）；chip 弹窗同时显示两条判定和累计计数。
 
-| 包 | 作用 |
-|---|---|
-| [`packages/dsh-auto-approval`](./packages/dsh-auto-approval) | **host 半**：pre-execute 分类器（L0 规则 + L1 LLM，两态 allow/deny） |
-| [`packages/dsh-client-ui-auto-approval`](./packages/dsh-client-ui-auto-approval) | **client 半**：聊天输入栏权限选择器旁的状态 chip，走 Typert remote 显示实时 deny 计数 |
+## 工作原理
+
+```text
+模型要调工具
+        │
+        ├─ preset ≠ automode ──────────────► 完全不接管（官方行为）
+        │
+        └─ preset = automode
+                 │
+                 ├─ L0 规则（硬底线）────────► deny   (rm -rf /、curl | sh、自毁命令 …)
+                 ├─ 免检工具 / bash 前缀 ────► allow
+                 └─ L1 分类器 ──────────────► allow | deny   （fail-closed：超时/解析失败/无模型 → deny）
+```
+
+- **L0** —— 正则 deny 规则 + 自毁护栏 + 免检工具/命令前缀白名单，确定性判定，不调模型。
+- **L1** —— 拿「最近一条真实用户消息 + 裸工具调用」给两阶段分类器（fast 单 token 过滤 → 命中才走 deep CoT）。**分类器永远看不到工具输出**，所以被注入的内容没法把它骗成 allow。
+- **fail-closed** —— 超时、解析失败、没有模型，一律 deny。
+
+automode preset 写的是和「完全权限」同一组旋钮（完全权限 + 审批 `never`），所以其它通道也不会再问人；两者的区别就是本插件这道闸门。官方 preset 服务会记住最后选中的名字，所以下拉里能区分你选的是哪一档。
 
 ## 安装
-
-一条命令把两个包都装到同一个 profile（npm 发布，装的是构建产物，无需构建环境）。host 包把 client 伴侣声明为依赖，AA 状态 chip 会一起装上：
 
 ```sh
 dsh plugin --profile web add dsh-auto-approval
 ```
 
-源码方式（开发/自建）见 [host 包 README](./packages/dsh-auto-approval)。
+然后在输入栏旁的权限下拉里选 **Automode**（或 `/permission automode`）。第一次选会在浏览器里弹一次性提示，说明这档的取舍（官方那个「Enable Full access?」确认硬编码在 `danger-full-access` 键上，自定义 preset 不会触发）。之后预设选择器旁边会出现 `Auto` 胶囊：累计放行/拦截计数，点开是决策表。
+
+源码方式：clone 后 `pnpm install && pnpm run build`，再 `dsh plugin --profile web add link:/<路径>`。
+
+## 从 0.1.x 升级
+
+0.2.0 保留了包名、`auto-approval:` 配置段和所有配置项，升级不需要改配置。变的是：
+
+| | 0.1.x | 0.2.0 |
+|---|---|---|
+| 开关 | 插件设置 `enabled` + UI 里的 switch | **Automode** 权限 preset（没有第二个开关） |
+| 包 | `dsh-auto-approval` + `dsh-client-ui-auto-approval` | `dsh-auto-approval`（host + 浏览器半边同一个包） |
+| 沙箱 | 看当前 preset；DSH 自己的升级询问照旧弹给用户 | 完全权限 + 审批 `never`，完全不弹窗 |
+| L1 未配置 | 全部放行（橡皮图章） | 白名单外一律拒绝 |
+
+```sh
+# 1. 卸掉旧的伴侣包（浏览器半边现在就在主包里）
+dsh plugin --profile web remove dsh-client-ui-auto-approval
+
+# 2. 升级
+pnpm --dir "$DSH_HOME/profiles/web" up dsh-auto-approval
+
+# 3. 重启 dsh，然后在权限下拉里选 Automode
+```
+
+如果 `settings.yaml` 里没配分类器（`classifierFastProvider` / `classifierFastModel`），automode 现在会 fail-closed——配上它，否则只有免检工具和白名单命令能跑。
+
+## 配置
+
+`$DSH_HOME/settings.yaml`，热重载：
+
+```yaml
+automode:
+  denyPatterns:
+    - 'rm\s+(-[a-z]*[fr][a-z]*\s+)*/\s*$'
+    - 'curl\s+[^|]*\x7c\s*(ba)?sh'
+  autoApproveTools: [read, write, edit, glob, grep, ls]
+  bashCommandPrefixes: [ls, pwd, git status, git diff, pnpm test]
+  classifierFastProvider: deepseek-official
+  classifierFastModel: deepseek-v4-flash
+  classifierDeepProvider: deepseek-official
+  classifierDeepModel: deepseek-v4-pro
+  classifierGuidance: '只读命令和跑测试优先放行。'
+```
+
+所有键都可选。`denyPatterns` / `autoApproveTools` / `bashCommandPrefixes` 是**整体替换**默认值（YAML 数组不合并），要保留的默认项得自己写全。
+
+不配 `classifierFastProvider`/`classifierFastModel` 就没有 L1，此时 automode **fail-closed**：只有免检工具和白名单命令能跑，其余一律拒绝。这是故意的——没有分类器的会话不是安全兜底，默认放行只会让这道闸门变成橡皮图章。
+
+## 权限与数据
+
+| 面 | 本插件做什么 |
+|---|---|
+| 读 | 待判定的工具调用参数；session log（仅用于取最近一条真实用户消息作为分类器意图） |
+| 写 | `$DSH_HOME/logs/automode.log`——本机 JSONL 审计文件，best-effort；写失败只记 warn |
+| 网络 | 仅当配置了 L1：把用户消息 + 工具调用发给所配置的模型服务 |
+| 执行 | 不执行任何东西。不起子进程、不走 shell、不改审计文件以外的文件 |
+| 拦截 | `tools/pre-execute`（prepend）+ 单调 `ctx.tools.guard()` deny 守卫，两者都按会话 preset 门控 |
+| 失败边界 | L1 超时 / 解析失败 / 无模型 → **deny**；配置非法在加载时 throw（fail-loud）；settings 服务缺失回退 composition entry 配置 |
 
 ## 兼容性
 
-只跟官方最新版走。当前在 `@deepseek-ai/dsh` **0.1.2-rc.1** 上实测通过（一次性 `DSH_HOME`：安装 → 启动 → 真实 tool call 判定）。旧版本不保证：harness 迭代很快，本插件只跟当前版本。
+只跟官方最新版走。当前在 `@deepseek-ai/dsh` **0.1.2-rc.1** 上实测通过（一次性 `DSH_HOME`：安装 → 启动 → 真实 tool call 判定）。旧版本不保证。
+
+bundle patch 会整体重述官方 preset 表，所以官方基础层新增 preset 时这个文件也要跟着更新。
 
 ## 开发
 
 ```sh
-pnpm install          # @deepseek-ai/* 依赖已公开发布在 npm，无需 token
-pnpm -r run build     # 两个包都构建
-pnpm -r run test      # host 单测
+pnpm install
+pnpm run typecheck
+pnpm run test
+pnpm run build     # lib/index.js（host）+ lib/client.js（browser）
 ```
 
 ## License

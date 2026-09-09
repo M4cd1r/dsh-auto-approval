@@ -1,0 +1,34 @@
+# The dsh-auto-approval bundle patch.
+#
+# Two rows, no disabling of anything official:
+#   1. `insert` mounts this package as one composition row (the host half; the
+#      same package's browser half is served by `dsh.client`).
+#   2. `permission` restates the whole preset table with a fourth entry.
+#      A patch replaces the targeted row's entire `config`, so every preset the
+#      base layer ships is restated verbatim — dropping one would remove it from
+#      the composer dropdown. `automode` shares the danger-full-access bundle
+#      (full access + approval `never`) on purpose: the classifier, not the
+#      sandbox, is what gates the session. The official preset service keeps
+#      the last `permission/preset` name, so the two shared-bundle entries stay
+#      distinguishable in the UI.
+- insert:
+    - id: auto-approval
+      name: 'dsh-auto-approval'
+
+- id: permission
+  config:
+    presets:
+      read-only:
+        sandbox: read-only
+        approval: ask
+      workspace-write:
+        sandbox: workspace-write
+        approval: ask
+      danger-full-access:
+        sandbox: danger-full-access
+        approval: never
+      automode:
+        sandbox: danger-full-access
+        approval: never
+        name: Automode
+        description: Full access with the classifier as the only gate before each tool call.

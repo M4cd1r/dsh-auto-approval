@@ -1,11 +1,15 @@
 name: publish
 
-# Publish both packages to npm (dsh-auto-approval + dsh-client-ui-auto-approval).
-# Trigger: manual dispatch, or a push of a `v*` tag (release flow).
+# Publish dsh-auto-approval to npm via trusted publishing (OIDC) — no long-lived token.
 #
-# Requires the repository secret `NPM_TOKEN` — a npm access token with
-# publish rights for the package names below (generate at
-# https://www.npmjs.com/settings/<user>/tokens).
+# Preconditions (one-time, done locally after the first interactive publish):
+#   npm trust github dsh-auto-approval --file publish.yml \
+#     --repo Andy8647/dsh-auto-approval --allow-publish
+# Requires npm >= 11.15 for the `npm trust` command itself; the publish job only
+# needs npm >= 11.5.1 (OIDC support) and Node >= 22.14.
+#
+# Do NOT add NODE_AUTH_TOKEN / NPM_TOKEN here: an auth token in the environment
+# takes precedence over OIDC and would silently fall back to token auth.
 
 on:
   workflow_dispatch:
@@ -13,32 +17,38 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: read
+  id-token: write # OIDC exchange; the job fails without it
+
 jobs:
   publish:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@v4
 
       - uses: pnpm/action-setup@v4
         with:
-          version: 11
+          version: 11.1.0
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
+
+      - name: Upgrade npm (OIDC needs >= 11.5.1)
+        run: npm install -g npm@latest
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Build both packages
-        run: pnpm -r run build
+      - name: Typecheck, test, build
+        run: |
+          pnpm run typecheck
+          pnpm run test
+          pnpm run build
 
+      # npm publish (not pnpm) on purpose: pnpm < 11.1 had OIDC regressions, and
+      # npm detects the OIDC environment natively.
       - name: Publish to npm
-        run: pnpm -r publish --no-git-checks
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
