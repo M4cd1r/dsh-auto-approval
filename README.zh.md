@@ -2,6 +2,12 @@
 
 [English](README.md) | [中文](README.zh.md)
 
+> ⚠️ **已弃用 —— 请用 [dsh-automode](https://github.com/Andy8647/dsh-automode)。**
+>
+> 本插件只挂 `tools/pre-execute`；DSH 自己的审批通道（尤其是沙箱升级）是另一条路，所以照样会弹给用户——“AA on” 从来不等于无人值守。`dsh-automode` 把同一套分类器重做成**第四档权限 preset**（完全权限 + 审批 `never`，完全不弹窗），前后端合成一个包。
+>
+> npm 上的 `dsh-auto-approval` 与 `dsh-client-ui-auto-approval` 已弃用，改用 `dsh-automode`。
+
 DSH 权限自动审批插件 —— 给 approval policy 加第三档 `auto`，classifier 对每个 tool call 做 **allow / deny** 两态决策（全托管，不转人工）。
 
 ## Demo

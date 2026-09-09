@@ -2,6 +2,12 @@
 
 [English](README.md) | [中文](README.zh.md)
 
+> ⚠️ **Deprecated — use [dsh-automode](https://github.com/Andy8647/dsh-automode) instead.**
+>
+> This plugin only hooks `tools/pre-execute`. DeepSeek Harness's own approval prompts (sandbox escalation in particular) are a separate channel, so they still went to the user — "AA on" never actually meant unattended. `dsh-automode` re-implements the same classifier as a **fourth permission preset** (full access + approval `never`, no prompts at all) and ships the host and browser halves in one package.
+>
+> The npm packages `dsh-auto-approval` and `dsh-client-ui-auto-approval` are deprecated in favour of `dsh-automode`.
+
 Automated tool-call approval for DeepSeek Harness: an `auto` tier for the approval policy that classifies every tool call as **allow / deny** (fully autonomous — no human in the loop, uncertain calls are denied).
 
 A monorepo of two packages:
