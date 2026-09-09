@@ -40,6 +40,13 @@ automode preset 写的是和「完全权限」同一组旋钮（完全权限 + �
 dsh plugin --profile web add dsh-auto-approval
 ```
 
+> **刚发新版？** pnpm 11 默认拒绝发布不足 24 小时的版本（`minimumReleaseAge`，供应链保护），所以发布当天 `add dsh-auto-approval` 会解析到**上一个版本**。要么装精确版本（`dsh plugin --profile web add dsh-auto-approval@0.2.0`），要么在 profile 的 `pnpm-workspace.yaml` 里加：
+>
+> ```yaml
+> minimumReleaseAgeExclude:
+>   - dsh-auto-approval
+> ```
+
 然后在输入栏旁的权限下拉里选 **Automode**（或 `/permission automode`）。第一次选会在浏览器里弹一次性提示，说明这档的取舍（官方那个「Enable Full access?」确认硬编码在 `danger-full-access` 键上，自定义 preset 不会触发）。之后预设选择器旁边会出现 `Auto` 胶囊：累计放行/拦截计数，点开是决策表。
 
 源码方式：clone 后 `pnpm install && pnpm run build`，再 `dsh plugin --profile web add link:/<路径>`。

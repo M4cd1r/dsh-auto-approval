@@ -40,6 +40,13 @@ The preset writes the same knobs as `danger-full-access` (full access + approval
 dsh plugin --profile web add dsh-auto-approval
 ```
 
+> **Just published a new version?** pnpm 11 refuses versions younger than 24 hours (`minimumReleaseAge`, a supply-chain default), so `add dsh-auto-approval` resolves the *previous* release for the first day. Install the exact version (`dsh plugin --profile web add dsh-auto-approval@0.2.0`) or add the package to the profile's `pnpm-workspace.yaml`:
+>
+> ```yaml
+> minimumReleaseAgeExclude:
+>   - dsh-auto-approval
+> ```
+
 Then pick **Automode** in the permission dropdown next to the composer (or `/permission automode`). The first time you do so in a browser, a one-time notice explains the trade-off (the official "Enable Full access?" gate is keyed to `danger-full-access` and never fires for a custom preset). The `Auto` chip then appears beside the preset selector with cumulative allow/deny counts and a click-through decision table.
 
 Source install: clone the repo, `pnpm install && pnpm run build`, then `dsh plugin --profile web add link:/<path>`.
