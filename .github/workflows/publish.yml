@@ -2,14 +2,23 @@ name: publish
 
 # Publish dsh-auto-approval to npm via trusted publishing (OIDC) — no long-lived token.
 #
-# Preconditions (one-time, done locally after the first interactive publish):
-#   npm trust github dsh-auto-approval --file publish.yml \
-#     --repo Andy8647/dsh-auto-approval --allow-publish
-# Requires npm >= 11.15 for the `npm trust` command itself; the publish job only
-# needs npm >= 11.5.1 (OIDC support) and Node >= 22.14.
+# One-time setup on npm (web UI, after this workflow is on the default branch):
+#   https://www.npmjs.com/package/dsh-auto-approval/access → Trusted Publishers → GitHub Actions
+#     Organization or user : Andy8647
+#     Repository           : dsh-auto-approval
+#     Workflow filename    : publish.yml        ← must match this file's name exactly
+#     Environment          : (leave empty)
+#     Allowed actions      : tick "npm publish" (new configs default to stage-publish only)
 #
-# Do NOT add NODE_AUTH_TOKEN / NPM_TOKEN here: an auth token in the environment
-# takes precedence over OIDC and would silently fall back to token auth.
+# Then release with:  git tag v0.2.0 && git push origin v0.2.0
+#
+# Two things that silently break OIDC, both guarded below:
+#   1. NODE_AUTH_TOKEN / NPM_TOKEN in the environment — a token takes precedence
+#      over OIDC, so the workflow never sets one.
+#   2. `actions/setup-node` with `registry-url` writes an `.npmrc`
+#      `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}` line that can make npm
+#      think a credential exists. We omit `registry-url` (npm defaults to the
+#      public registry anyway) and assert the auth line is empty before publishing.
 
 on:
   workflow_dispatch:
@@ -20,6 +29,10 @@ on:
 permissions:
   contents: read
   id-token: write # OIDC exchange; the job fails without it
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -34,12 +47,22 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-          registry-url: 'https://registry.npmjs.org'
+          # No `registry-url`: see the OIDC note at the top.
 
       - name: Upgrade npm (OIDC needs >= 11.5.1)
-        run: npm install -g npm@latest
+        run: |
+          npm install -g npm@latest
+          npm --version
 
-      - name: Install dependencies
+      - name: Tag must match package.json version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          echo "tag=$tag package=$pkg"
+          test "$tag" = "$pkg"
+
+      - name: Install
         run: pnpm install --frozen-lockfile
 
       - name: Typecheck, test, build
@@ -48,7 +71,21 @@ jobs:
           pnpm run test
           pnpm run build
 
-      # npm publish (not pnpm) on purpose: pnpm < 11.1 had OIDC regressions, and
-      # npm detects the OIDC environment natively.
-      - name: Publish to npm
-        run: npm publish --access public
+      - name: Assert no token can shadow OIDC
+        run: |
+          if [ -n "${NODE_AUTH_TOKEN:-}" ]; then echo "::error::NODE_AUTH_TOKEN is set"; exit 1; fi
+          if [ -n "${NPM_TOKEN:-}" ]; then echo "::error::NPM_TOKEN is set"; exit 1; fi
+          # `npm config get ...:_authToken` is refused by npm (protected option), so
+          # inspect the config files npm would read instead.
+          if [ -f .npmrc ] && grep -qs "_authToken" .npmrc; then
+            echo "::error::.npmrc in the repo defines _authToken; OIDC would be shadowed"
+            exit 1
+          fi
+          if [ -f "$HOME/.npmrc" ] && grep -qs "_authToken" "$HOME/.npmrc"; then
+            echo "::error::~/.npmrc defines _authToken; OIDC would be shadowed"
+            exit 1
+          fi
+          echo "no npm auth token configured - OIDC will be used"
+
+      - name: Publish (trusted publishing)
+        run: npm publish
