@@ -28,6 +28,8 @@ export type DecisionStage =
   | 'L1-fast'
   /** L1 Stage 2 CoT 深查得出结论。 */
   | 'L1-deep'
+  /** L1 Jev backend：一次请求的类型化概率判定。 */
+  | 'L1-jev'
   /** L1 不可用（无模型/无意图/超时/解析失败），fail-closed 转 deny。 */
   | 'L1-fail-closed'
   /** 未配置分类器路由：白名单之外 fail-closed deny。 */
@@ -102,6 +104,15 @@ export function auditArmed(ctx: Context, summary: {
   readonly classifier: string
 }): void {
   enqueueLogLine(ctx, { type: 'auto-approval/armed', time: new Date().toISOString(), ...summary })
+}
+
+/**
+ * 只进文件日志的补充记录（**永不进 session 事件**）——jev 的原始信号、
+ * usage.input_tokens、实际 model 版本号等审计元数据走这里，避免
+ * session 事件体积膨胀。
+ */
+export function auditFileOnly(ctx: Context, kind: string, data: Record<string, unknown>): void {
+  enqueueLogLine(ctx, { type: `auto-approval/${kind}`, time: new Date().toISOString(), ...data })
 }
 
 /**

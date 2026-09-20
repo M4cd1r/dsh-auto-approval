@@ -29,7 +29,7 @@
 ```
 
 - **L0** —— 正则 deny 规则 + 自毁护栏 + 免检工具/命令前缀白名单，确定性判定，不调模型。
-- **L1** —— 拿「最近一条真实用户消息 + 裸工具调用」给两阶段分类器（fast 单 token 过滤 → 命中才走 deep CoT）。**分类器永远看不到工具输出**，所以被注入的内容没法把它骗成 allow。
+- **L1** —— 拿「最近一条真实用户消息 + 裸工具调用」给分类器。两个 backend：**`llm`**（默认）走聊天模型的两阶段 prompt（fast 单 token 过滤 → 命中才走 deep CoT）；**`jev`** 向 TypeSafe System One 发一次 HTTP 请求拿回类型化概率，判定就是阈值比较，没有文本解析。两个 backend 下**分类器都永远看不到工具输出**，所以被注入的内容没法把它骗成 allow。
 - **fail-closed** —— 超时、解析失败、没有模型，一律 deny。
 
 automode preset 写的是和「完全权限」同一组旋钮（完全权限 + 审批 `never`），所以其它通道也不会再问人；两者的区别就是本插件这道闸门。官方 preset 服务会记住最后选中的名字，所以下拉里能区分你选的是哪一档。
@@ -79,7 +79,7 @@ pnpm --dir "$DSH_HOME/profiles/web" up dsh-auto-approval
 `$DSH_HOME/settings.yaml`，热重载：
 
 ```yaml
-automode:
+auto-approval:
   denyPatterns:
     - 'rm\s+(-[a-z]*[fr][a-z]*\s+)*/\s*$'
     - 'curl\s+[^|]*\x7c\s*(ba)?sh'
@@ -94,22 +94,44 @@ automode:
 
 所有键都可选。`denyPatterns` / `autoApproveTools` / `bashCommandPrefixes` 是**整体替换**默认值（YAML 数组不合并），要保留的默认项得自己写全。
 
-不配 `classifierFastProvider`/`classifierFastModel` 就没有 L1，此时 automode **fail-closed**：只有免检工具和白名单命令能跑，其余一律拒绝。这是故意的——没有分类器的会话不是安全兜底，默认放行只会让这道闸门变成橡皮图章。
+不配分类器就没有 L1，此时 automode **fail-closed**：只有免检工具和白名单命令能跑，其余一律拒绝。这是故意的——没有分类器的会话不是安全兜底，默认放行只会让这道闸门变成橡皮图章。
+
+### Jev backend（TypeSafe System One）
+
+`classifierBackend: jev` 把两阶段 LLM prompt 换成一次 [Jev](https://docs.typesafe.ai/api) 类型化概率调用。Jev 不生成文本：一次请求对同一个帧（最近用户消息 + tool 名 + 参数）回答五个问题、返回校准概率，判定就是代码里的一次阈值比较——整条文本解析链路（VERDICT 行、截断收尾、token 预算）不复存在。一次往返约 300ms。
+
+```sh
+export TYPESAFE_API_KEY=<你的密钥>   # 推荐方式，见下方警告
+```
+
+```yaml
+auto-approval:
+  classifierBackend: jev
+  # 可选：
+  jevModel: jev-latest        # 默认值；响应带实际版本号，记进日志供追溯
+  jevAllowThreshold: 0.9      # 默认值；必须落在开区间 (0, 1)
+```
+
+超时复用 `classifierTimeoutMs`，不新增键。不要把 `classifierBackend: jev` 和 `classifierFast*`/`classifierDeep*` 路由同时配置——歧义配置在加载期直接 throw（fail-loud）。密钥从 `jevApiKey` 解析，缺省回退 `TYPESAFE_API_KEY` 环境变量。**警告：`jevApiKey` 写进 settings.yaml 就是明文落盘——优先用环境变量。** 密钥永不出现在日志、审计事件或 deny reason 里。
+
+**一个闸门，四个证人。** 一次请求问五个问题，只有 `clearly_safe` 参与判定：`noul ≥ jevAllowThreshold` 放行，否则拒绝。`destructive`、`exfiltration`、`beyond_scope`、`impact` **只记录、不拦**——它们的合理阈值必须在你自己的真实 session 上量出来（分类器阈值跨数据集不迁移是普遍教训），先读几十条真实判定日志里的信号分布，再决定要不要升格为闸门。每条 Jev 判定都会在文件日志里写一行，含五个信号数值、`usage.input_tokens` 和实际回答的模型版本号。
+
+**速率与「不重试」的取舍。** jev-1.13 限额 1200 请求/分钟、250k token/秒；输出 token 免费，输入计费（撰文时 $0.042/MTok）。闸门永不重试：429/529（或任何失败）直接拒绝这次调用，不给工具流水线加尾部延迟。撞到限额的表现是「automode 拒绝并告诉你」，而不是「automode 挂起」。
 
 ## 权限与数据
 
 | 面 | 本插件做什么 |
 |---|---|
 | 读 | 待判定的工具调用参数；session log（仅用于取最近一条真实用户消息作为分类器意图） |
-| 写 | `$DSH_HOME/logs/automode.log`——本机 JSONL 审计文件，best-effort；写失败只记 warn |
-| 网络 | 仅当配置了 L1：把用户消息 + 工具调用发给所配置的模型服务 |
+| 写 | `$DSH_HOME/logs/auto-approval.log`——本机 JSONL 审计文件，best-effort；写失败只记 warn |
+| 网络 | 仅当配置了 L1。`llm` backend：用户消息 + 工具调用发给所配置的模型服务。`jev` backend（默认关闭）：**最近一条真实用户消息**（截断到 4000 字）、**tool 名**、**参数 JSON**（截断到 8000 字）发往 `https://api.typesafe.ai/v1/systemone`。两个 backend 都**永不发送 tool 输出**——这是注入防线，不是巧合 |
 | 执行 | 不执行任何东西。不起子进程、不走 shell、不改审计文件以外的文件 |
 | 拦截 | `tools/pre-execute`（prepend）+ 单调 `ctx.tools.guard()` deny 守卫，两者都按会话 preset 门控 |
 | 失败边界 | L1 超时 / 解析失败 / 无模型 → **deny**；配置非法在加载时 throw（fail-loud）；settings 服务缺失回退 composition entry 配置 |
 
 ## 兼容性
 
-只跟官方最新版走。当前在 `@deepseek-ai/dsh` **0.1.2-rc.1** 上实测通过（一次性 `DSH_HOME`：安装 → 启动 → 真实 tool call 判定）。旧版本不保证。
+只跟官方最新版走。已在 `@deepseek-ai/dsh` **0.1.2-rc.1** 和 **0.1.5-rc.2** 上实测通过（一次性 `DSH_HOME`：安装 → 启动 → 真实 tool call 判定）。旧版本不保证。
 
 bundle patch 会整体重述官方 preset 表，所以官方基础层新增 preset 时这个文件也要跟着更新。
 

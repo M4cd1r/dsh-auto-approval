@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest'
-import { resolveConfig } from '../src/config.ts'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { describeClassifier, resolveConfig } from '../src/config.ts'
 import {
   createDenyGuard,
   DENY_REASON,
@@ -40,6 +40,57 @@ describe('resolveConfig（M1 fail-loud）', () => {
 
   it('未配置 fast 时 L1 关闭', () => {
     expect(resolveConfig({}).classifier).toBeUndefined()
+  })
+
+  it('默认 backend 为 llm，现有解析结果不变', () => {
+    const resolved = resolveConfig({ classifierFastProvider: 'p', classifierFastModel: 'm' })
+    expect(resolved.classifier).toMatchObject({ backend: 'llm' })
+    expect(describeClassifier(resolved.classifier!)).toBe('p/m')
+  })
+})
+
+describe('resolveConfig · jev backend', () => {
+  afterEach(() => { vi.unstubAllEnvs() })
+
+  it('jev + 无密钥（配置与 TYPESAFE_API_KEY 都没有）→ throw，错误同时点明两个来源', () => {
+    vi.stubEnv('TYPESAFE_API_KEY', undefined as unknown as string)
+    expect(() => resolveConfig({ classifierBackend: 'jev' }))
+      .toThrow(/jevApiKey.*TYPESAFE_API_KEY|TYPESAFE_API_KEY.*jevApiKey/)
+  })
+
+  it('jevApiKey 配置优先于 TYPESAFE_API_KEY 环境变量', () => {
+    vi.stubEnv('TYPESAFE_API_KEY', 'env-key')
+    const resolved = resolveConfig({ classifierBackend: 'jev', jevApiKey: 'config-key' })
+    expect(resolved.classifier).toMatchObject({ backend: 'jev', apiKey: 'config-key' })
+  })
+
+  it('TYPESAFE_API_KEY 环境变量作为密钥回退', () => {
+    vi.stubEnv('TYPESAFE_API_KEY', 'env-key')
+    const resolved = resolveConfig({ classifierBackend: 'jev' })
+    expect(resolved.classifier).toMatchObject({
+      backend: 'jev',
+      apiKey: 'env-key',
+      route: { provider: 'typesafe', model: 'jev-latest' },
+      baseUrl: 'https://api.typesafe.ai',
+      allowThreshold: 0.9,
+    })
+    expect(describeClassifier(resolved.classifier!)).toBe('typesafe/jev-latest')
+  })
+
+  it('jevAllowThreshold 取 0 / 1 / NaN → throw（必须在开区间 (0,1)）', () => {
+    for (const jevAllowThreshold of [0, 1, Number.NaN]) {
+      expect(() => resolveConfig({ classifierBackend: 'jev', jevApiKey: 'k', jevAllowThreshold }))
+        .toThrow(/jevAllowThreshold/)
+    }
+  })
+
+  it('jev 同时配了 classifierFastProvider → throw（两个 backend 同配是歧义）', () => {
+    expect(() => resolveConfig({
+      classifierBackend: 'jev',
+      jevApiKey: 'k',
+      classifierFastProvider: 'p',
+      classifierFastModel: 'm',
+    })).toThrow(/cannot be combined/)
   })
 })
 

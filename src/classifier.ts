@@ -17,7 +17,8 @@ import { BlockAssembler, createUserMessage, ReasoningEffortId } from '@deepseek-
 import type { GenerateOptions, Message, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { deepFreeze } from '@deepseek-ai/dsh-util-values'
 import { deadline } from '@deepseek-ai/dsh-timeout'
-import type { ModelRoute, ResolvedClassifierConfig } from './config.ts'
+import type { ModelRoute, ResolvedLlmClassifierConfig } from './config.ts'
+import { frameCall, truncate } from './frame.ts'
 
 /** ctx.llm 的最小结构类型（真实 LlmService 可赋入，测试可 stub）。 */
 export interface LlmLike {
@@ -38,30 +39,15 @@ export type ClassifierOutcome =
   | { readonly status: 'allow'; readonly stage: 'L1-fast'; readonly route: ModelRoute; readonly latencyMs: number }
   /** Stage 2 二态结论（rationale 进审计，不回模型）。全托管无 ask：不确定即 DENY。 */
   | { readonly status: 'allow' | 'deny'; readonly stage: 'L1-deep'; readonly route: ModelRoute; readonly latencyMs: number; readonly rationale: string }
+  /**
+   * Jev backend：一次请求的类型化概率判定。`rationale` 是各信号概率的
+   * **数字摘要**（不是模型生成的 CoT 解释——jev 不生成文本）；`signals`
+   * 为各问题的概率原始值，`model` 为响应里实际回答的模型版本号
+   * （`jev-latest` 会漂移，追溯答案变化时要用实际值）。
+   */
+  | { readonly status: 'allow' | 'deny'; readonly stage: 'L1-jev'; readonly route: ModelRoute; readonly latencyMs: number; readonly rationale: string; readonly signals: Readonly<Record<string, number>>; readonly model: string; readonly inputTokens?: number }
   /** 任一阶段的失败：超时/解析失败/模型异常。调用方必须转 deny（全托管 fail-closed 即拒）。 */
-  | { readonly status: 'fail-closed'; readonly stage: 'L1-fast' | 'L1-deep'; readonly error: string }
-
-/** prompt 规模上限：用户意图 / 参数 JSON 各自截断，避免审计调用失控放大。 */
-const MAX_INTENT_CHARS = 4000
-const MAX_ARGS_CHARS = 8000
-
-function truncate(text: string, max: number): string {
-  return text.length <= max ? text : `${text.slice(0, max - 1)}…`
-}
-
-/** 把 tool call 帧成 JSON——用户文本无法冲破结构边界（session-title 同款惯例）。 */
-function frameCall(input: ClassifierInput): string {
-  let argsText: string
-  try {
-    argsText = JSON.stringify(input.args) ?? 'null'
-  } catch {
-    argsText = '"<unserializable arguments>"'
-  }
-  return JSON.stringify({
-    user_request: truncate(input.intent, MAX_INTENT_CHARS),
-    tool_call: { name: input.toolName, arguments: truncate(argsText, MAX_ARGS_CHARS) },
-  })
-}
+  | { readonly status: 'fail-closed'; readonly stage: 'L1-fast' | 'L1-deep' | 'L1-jev'; readonly error: string }
 
 const STAGE1_SYSTEM = [
   'You are a security filter for an autonomous AI coding assistant.',
@@ -162,7 +148,7 @@ const VERDICT_PATTERN = /VERDICT:\s*(ALLOW|DENY)/gi
  */
 export async function classifyL1(
   llm: LlmLike,
-  config: ResolvedClassifierConfig,
+  config: ResolvedLlmClassifierConfig,
   input: ClassifierInput,
 ): Promise<ClassifierOutcome> {
   const framed = frameCall(input)

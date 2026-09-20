@@ -45,10 +45,26 @@ export interface Config {
   classifierDeepProvider?: string
   /** L1 Stage 2（CoT 深查）的 model；缺省沿用 fast。 */
   classifierDeepModel?: string
-  /** L1 单次模型调用的超时（毫秒），超时 fail-closed 转 deny。 */
+  /** L1 单次模型调用 / HTTP 请求的超时（毫秒），超时 fail-closed 转 deny。两个 backend 共用。 */
   classifierTimeoutMs?: number
-  /** 用户自定义判定准则，作为 guidance 注入 L1 prompt（不是硬规则）。 */
+  /** 用户自定义判定准则，作为 guidance 注入 L1（llm：prompt；jev：主问题 instructions 的 advisory 段）。不是硬规则。 */
   classifierGuidance?: string
+  /**
+   * L1 判定 backend：`'llm'`（默认，ctx.llm 两阶段文本判定）或
+   * `'jev'`（TypeSafe System One，一次 HTTP 请求返回类型化概率，阈值判定）。
+   */
+  classifierBackend?: 'llm' | 'jev'
+  /**
+   * Jev backend 的 API 密钥。缺省回退环境变量 `TYPESAFE_API_KEY`。
+   * ⚠️ 写在这里会**明文落进 settings.yaml**——推荐用环境变量。
+   */
+  jevApiKey?: string
+  /** Jev API 根地址；缺省回退 `TYPESAFE_BASE_URL`，再缺省 `https://api.typesafe.ai`。 */
+  jevBaseUrl?: string
+  /** Jev 模型名，默认 `jev-latest`（响应会带实际版本号，进文件日志）。 */
+  jevModel?: string
+  /** Jev 放行阈值：`clearly_safe` 概率 ≥ 此值才 allow。必须在开区间 (0,1)。默认 0.9。 */
+  jevAllowThreshold?: number
 }
 
 /** Runtime configuration schema (schemastery fills defaults before construction). */
@@ -92,6 +108,11 @@ export const Config: z<Config> = z.object({
   classifierDeepModel: z.string(),
   classifierTimeoutMs: z.number().default(20_000),
   classifierGuidance: z.string(),
+  classifierBackend: z.union(['llm', 'jev']).default('llm'),
+  jevApiKey: z.string(),
+  jevBaseUrl: z.string(),
+  jevModel: z.string().default('jev-latest'),
+  jevAllowThreshold: z.number().default(0.9),
 })
 
 /** 一个具体的模型路由（ctx.llm 要求 provider + model 成对）。 */
@@ -100,8 +121,9 @@ export interface ModelRoute {
   readonly model: string
 }
 
-/** L1 classifier 的解析后配置。 */
-export interface ResolvedClassifierConfig {
+/** L1 classifier 的解析后配置：llm backend（ctx.llm 两阶段文本判定）。 */
+export interface ResolvedLlmClassifierConfig {
+  readonly backend: 'llm'
   /** Stage 1 fast 单 token 过滤。 */
   readonly fast: ModelRoute
   /** Stage 2 CoT 深查（缺省与 fast 相同）。 */
@@ -110,6 +132,37 @@ export interface ResolvedClassifierConfig {
   readonly timeoutMs: number
   /** 用户 guidance 文本（注入 prompt，非硬规则）。 */
   readonly guidance?: string
+}
+
+/**
+ * L1 classifier 的解析后配置：jev backend（TypeSafe System One）。
+ * `route` 复用 ModelRoute 形态（provider 固定 `'typesafe'`），审计事件的
+ * route 字段直接复用。**apiKey 永不进日志 / 审计 / deny reason。**
+ */
+export interface ResolvedJevConfig {
+  readonly backend: 'jev'
+  /** 审计口径的路由：`{ provider: 'typesafe', model: jevModel }`。 */
+  readonly route: ModelRoute
+  /** API 密钥（jevApiKey 配置优先于 TYPESAFE_API_KEY 环境变量）。 */
+  readonly apiKey: string
+  /** API 根地址（jevBaseUrl 配置优先于 TYPESAFE_BASE_URL 环境变量）。 */
+  readonly baseUrl: string
+  /** 单次 HTTP 请求超时（毫秒），复用 classifierTimeoutMs。 */
+  readonly timeoutMs: number
+  /** 放行阈值：clearly_safe ≥ 此值才 allow，开区间 (0,1)。 */
+  readonly allowThreshold: number
+  /** 用户 guidance 文本（并入主问题 instructions 的 advisory 段，非硬规则）。 */
+  readonly guidance?: string
+}
+
+/** L1 classifier 的解析后配置（按 backend 区分）。 */
+export type ResolvedClassifierConfig = ResolvedLlmClassifierConfig | ResolvedJevConfig
+
+/** 人类可读的 classifier 描述（arm 日志 / remote status 共用）。 */
+export function describeClassifier(config: ResolvedClassifierConfig): string {
+  return config.backend === 'llm'
+    ? `${config.fast.provider}/${config.fast.model}`
+    : `${config.route.provider}/${config.route.model}`
 }
 
 /**
@@ -180,6 +233,9 @@ export function resolveConfig(config: Config = {}): ResolvedConfig {
     autoApproveTools: string[]
     bashCommandPrefixes: string[]
     classifierTimeoutMs: number
+    classifierBackend: 'llm' | 'jev'
+    jevModel: string
+    jevAllowThreshold: number
     selfKillGuard: boolean
     auditSessionEvents: boolean
   }
@@ -190,6 +246,41 @@ export function resolveConfig(config: Config = {}): ResolvedConfig {
   }
   const fast = resolveRoute('classifierFast', resolved.classifierFastProvider, resolved.classifierFastModel)
   const deep = resolveRoute('classifierDeep', resolved.classifierDeepProvider, resolved.classifierDeepModel)
+  if (resolved.classifierBackend === 'jev') {
+    // 两个 backend 同时配置是歧义：静默忽略一边会让用户以为生效的
+    // 配置实际没生效，fail-loud 直接拒绝（M1）。
+    if (fast !== undefined || deep !== undefined) {
+      throw new Error('automode: classifierBackend \'jev\' cannot be combined with classifierFast/classifierDeep (llm routing); remove one side')
+    }
+    const apiKey = resolved.jevApiKey ?? process.env.TYPESAFE_API_KEY
+    if (apiKey === undefined || apiKey.length === 0) {
+      throw new Error('automode: classifierBackend \'jev\' requires an API key: set jevApiKey or the TYPESAFE_API_KEY environment variable')
+    }
+    if (!Number.isFinite(resolved.jevAllowThreshold)
+      || resolved.jevAllowThreshold <= 0 || resolved.jevAllowThreshold >= 1) {
+      throw new Error('automode: jevAllowThreshold must be a finite number in the open interval (0, 1)')
+    }
+    const baseUrl = resolved.jevBaseUrl ?? process.env.TYPESAFE_BASE_URL ?? 'https://api.typesafe.ai'
+    return {
+      deny,
+      denySources: resolved.denyPatterns,
+      ask,
+      askSources: resolved.askPatterns,
+      autoApproveTools: new Set(resolved.autoApproveTools),
+      bashCommandPrefixes: resolved.bashCommandPrefixes,
+      selfKillGuard: resolved.selfKillGuard,
+      auditSessionEvents: resolved.auditSessionEvents,
+      classifier: {
+        backend: 'jev',
+        route: { provider: 'typesafe', model: resolved.jevModel },
+        apiKey,
+        baseUrl,
+        timeoutMs: resolved.classifierTimeoutMs,
+        allowThreshold: resolved.jevAllowThreshold,
+        ...resolved.classifierGuidance === undefined ? {} : { guidance: resolved.classifierGuidance },
+      },
+    }
+  }
   if (deep !== undefined && fast === undefined) {
     throw new Error('automode: classifierDeep requires classifierFast (Stage 1 always runs before Stage 2)')
   }
@@ -204,6 +295,7 @@ export function resolveConfig(config: Config = {}): ResolvedConfig {
     auditSessionEvents: resolved.auditSessionEvents,
     ...fast === undefined ? {} : {
       classifier: {
+        backend: 'llm' as const,
         fast,
         deep: deep ?? fast,
         timeoutMs: resolved.classifierTimeoutMs,

@@ -5,6 +5,7 @@ import type { LlmLike } from '../src/classifier.ts'
 import type { ResolvedClassifierConfig } from '../src/config.ts'
 
 const CONFIG: ResolvedClassifierConfig = {
+  backend: 'llm',
   fast: { provider: 'p', model: 'fast-m' },
   deep: { provider: 'p', model: 'deep-m' },
   timeoutMs: 5000,

@@ -24,12 +24,13 @@ import type { PreToolDecision, ToolExecution, ToolGuard } from '@deepseek-ai/dsh
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import type {} from '@deepseek-ai/dsh-settings'
-import { Config, resolveConfig } from './config.ts'
+import { Config, describeClassifier, resolveConfig } from './config.ts'
 import type { ResolvedConfig } from './config.ts'
 import { classifyL1 } from './classifier.ts'
-import type { LlmLike } from './classifier.ts'
+import type { ClassifierOutcome, LlmLike } from './classifier.ts'
+import { classifyJev } from './jev.ts'
 import { createDenyGuard, DENY_REASON, extractMatchableText, matchBashPrefix, matchFirst, matchSelfKill, selfKillDenyReason } from './rules.ts'
-import { audit, auditArmed } from './audit.ts'
+import { audit, auditArmed, auditFileOnly } from './audit.ts'
 import type { AutomodeDecisionEvent, DecisionStage } from './audit.ts'
 import { AutomodeStatusService } from './remote.ts'
 import type { HistoryReader, StatusReader } from './remote.ts'
@@ -124,7 +125,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       autoApproveTools: resolved.autoApproveTools.size,
       classifier: resolved.classifier === undefined
         ? 'disabled'
-        : `${resolved.classifier.fast.provider}/${resolved.classifier.fast.model}`,
+        : describeClassifier(resolved.classifier),
       denials: tracker.denials(agent),
       approvals: counts.approvals,
       totalDenials: counts.denials,
@@ -166,7 +167,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       `${resolved.autoApproveTools.size} auto-approve tools, ${resolved.bashCommandPrefixes.length} bash prefixes, ` +
       (resolved.classifier === undefined
         ? ', L1 disabled (fail-closed outside the allowlists)'
-        : `, L1 fast=${resolved.classifier.fast.provider}/${resolved.classifier.fast.model}`),
+        : `, L1 ${describeClassifier(resolved.classifier)}`),
     )
     auditArmed(ctx, {
       deny: resolved.deny.length,
@@ -174,7 +175,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       autoApproveTools: resolved.autoApproveTools.size,
       classifier: resolved.classifier === undefined
         ? 'disabled'
-        : `${resolved.classifier.fast.provider}/${resolved.classifier.fast.model}`,
+        : describeClassifier(resolved.classifier),
     })
   }
 
@@ -268,42 +269,58 @@ export function apply(ctx: Context, config: Config = {}): void {
       return next()
     }
 
-    // ---- L1 LLM classifier（配置 fast 路由后启用） ----
+    // ---- L1 classifier（配置后启用；backend: 'llm' 两阶段文本判定 / 'jev' 类型化概率） ----
     if (resolved.classifier !== undefined) {
-      const llm = ctx.get('llm') as LlmLike | undefined
+      const classifier = resolved.classifier
       const intent = latestUserIntent(agent)
-      if (llm === undefined || intent === undefined) {
-        const detail = llm === undefined ? 'no ctx.llm service' : 'no user message in session log'
+      // jev backend 不依赖 ctx.llm（直连 HTTP）；llm backend 需要模型服务。
+      const llm = classifier.backend === 'llm' ? ctx.get('llm') as LlmLike | undefined : undefined
+      if (intent === undefined || (classifier.backend === 'llm' && llm === undefined)) {
+        const detail = intent === undefined ? 'no user message in session log' : 'no ctx.llm service'
         auditDecision(ctx, agent, { tool: exec.name, callId, stage: 'L1-fail-closed', decision: 'deny', detail })
         return { kind: 'deny', reason: L1_UNAVAILABLE_REASON }
       }
-      const outcome = await classifyL1(llm, resolved.classifier, {
+      const classifierInput = {
         intent,
         toolName: exec.name,
         args: exec.arguments as JsonValue,
         ...agent === undefined ? {} : { sessionId: agent.session.id },
         signal: exec.signal,
-      })
+      }
+      const outcome: ClassifierOutcome = classifier.backend === 'jev'
+        ? await classifyJev({ fetch }, classifier, classifierInput)
+        : await classifyL1(llm as LlmLike, classifier, classifierInput)
       if (outcome.status === 'fail-closed') {
         logger.warn(`L1 ${outcome.stage} failed for ${exec.name} (${callId}): ${outcome.error}`)
         auditDecision(ctx, agent, { tool: exec.name, callId, stage: 'L1-fail-closed', decision: 'deny', detail: outcome.error })
         return { kind: 'deny', reason: L1_FAILED_REASON }
       }
       const stage: DecisionStage = outcome.stage
+      // jev 的审计元数据（原始信号 / usage.input_tokens / 实际 model 版本号）
+      // 只进文件日志，不进 session 事件（避免 session 事件体积膨胀）。
+      // apiKey 不在其中——它永不进任何日志。
+      if (outcome.stage === 'L1-jev') {
+        logger.info(`L1-jev ${outcome.status} ${exec.name} (${callId}): ${outcome.rationale} · model=${outcome.model} · input_tokens=${outcome.inputTokens ?? 'n/a'}`)
+        auditFileOnly(ctx, 'jev', {
+          tool: exec.name, callId, decision: outcome.status,
+          signals: outcome.signals, model: outcome.model,
+          ...outcome.inputTokens === undefined ? {} : { inputTokens: outcome.inputTokens },
+        })
+      }
       if (outcome.status === 'deny') {
         tracker.recordDenial(agent)
-        logger.info(`L1 deny ${exec.name} (${callId})${outcome.stage === 'L1-deep' ? `: ${outcome.rationale}` : ''}`)
+        logger.info(`L1 deny ${exec.name} (${callId})${'rationale' in outcome ? `: ${outcome.rationale}` : ''}`)
         auditDecision(ctx, agent, {
           tool: exec.name, callId, stage, decision: 'deny', route: outcome.route,
           latencyMs: outcome.latencyMs,
-          ...outcome.stage === 'L1-deep' ? { detail: outcome.rationale } : {},
+          ...'rationale' in outcome ? { detail: outcome.rationale } : {},
         })
         return { kind: 'deny', reason: DENY_REASON }
       }
       auditDecision(ctx, agent, {
         tool: exec.name, callId, stage, decision: outcome.status, route: outcome.route,
         latencyMs: outcome.latencyMs,
-        ...outcome.stage === 'L1-deep' ? { detail: outcome.rationale } : {},
+        ...'rationale' in outcome ? { detail: outcome.rationale } : {},
       })
       // L1 只剩 allow/deny 两态：deny 已在上方返回，这里只剩 allow → 放行。
       return next()

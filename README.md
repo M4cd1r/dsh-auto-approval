@@ -29,7 +29,7 @@ model wants a tool call
 ```
 
 - **L0** — regex deny rules, self-kill guard, trusted-tool and bash-prefix allowlists. Deterministic, no model call.
-- **L1** — the latest real user message plus the bare tool call go to a two-stage classifier (fast single-token filter → deep CoT check when flagged). Tool output is never shown to the classifier, so injected content cannot talk it into an allow.
+- **L1** — the latest real user message plus the bare tool call go to a classifier. Two backends: **`llm`** (default) runs a two-stage prompt on a chat model (fast single-token filter → deep CoT check when flagged); **`jev`** sends one HTTP request to TypeSafe's System One and gets back typed probabilities — the verdict is a threshold comparison, no text parsing. Tool output is never shown to the classifier on either backend, so injected content cannot talk it into an allow.
 - **Fail-closed** — a timeout, a parse failure, or a missing model denies the call.
 
 The preset writes the same knobs as `danger-full-access` (full access + approval `never`), so nothing else asks the user either. What distinguishes the two entries is the plugin's gate — and the official preset service keeps the last selected name, so the dropdown shows which one you picked.
@@ -79,7 +79,7 @@ If your `settings.yaml` has no classifier configured (`classifierFastProvider` /
 `$DSH_HOME/settings.yaml`, hot-reloaded:
 
 ```yaml
-automode:
+auto-approval:
   denyPatterns:
     - 'rm\s+(-[a-z]*[fr][a-z]*\s+)*/\s*$'
     - 'curl\s+[^|]*\x7c\s*(ba)?sh'
@@ -94,22 +94,44 @@ automode:
 
 Every key is optional. `denyPatterns` / `autoApproveTools` / `bashCommandPrefixes` **replace** the defaults wholesale (YAML arrays do not merge), so restate the values you want to keep.
 
-Without `classifierFastProvider`/`classifierFastModel` there is no L1, and automode fails closed: only trusted tools and allowlisted commands run, everything else is denied. That is deliberate — a session with no classifier is not a safety net, and silently allowing everything would make the gate a rubber stamp.
+Without a classifier there is no L1, and automode fails closed: only trusted tools and allowlisted commands run, everything else is denied. That is deliberate — a session with no classifier is not a safety net, and silently allowing everything would make the gate a rubber stamp.
+
+### Jev backend (TypeSafe System One)
+
+`classifierBackend: jev` replaces the two-stage LLM prompt with a single typed-probability call to [Jev](https://docs.typesafe.ai/api). Jev does not generate text: one request returns calibrated probabilities for five questions asked over the same frame (latest user message + tool name + arguments), and the verdict is a threshold comparison in code — the whole text-parsing chain (VERDICT lines, truncation finishes, token budgets) disappears. One round trip, ~300 ms.
+
+```sh
+export TYPESAFE_API_KEY=<your key>   # recommended; see the warning below
+```
+
+```yaml
+auto-approval:
+  classifierBackend: jev
+  # optional:
+  jevModel: jev-latest        # default; the response carries the actual version, logged for traceability
+  jevAllowThreshold: 0.9      # default; must be in the open interval (0, 1)
+```
+
+`classifierTimeoutMs` is reused as the per-request timeout — no new key. Do **not** combine `classifierBackend: jev` with `classifierFast*`/`classifierDeep*` routes: ambiguous configuration throws at load (fail-loud). The API key resolves from `jevApiKey` first, then `TYPESAFE_API_KEY`. **Warning: `jevApiKey` in settings.yaml is stored in plaintext — prefer the environment variable.** The key never appears in logs, audit events, or deny reasons.
+
+**One gate, four witnesses.** Of the five questions asked in the single request, only `clearly_safe` decides: `noul ≥ jevAllowThreshold` → allow, otherwise deny. `destructive`, `exfiltration`, `beyond_scope` and `impact` are **recorded, not enforced** — their useful thresholds have to be measured on your own real sessions (classifier thresholds do not transfer across datasets), so read a few dozen real decisions from the log's signal distributions before promoting any of them to a gate. Every Jev decision writes a file-log line with all five signal values, `usage.input_tokens`, and the actual model version that answered.
+
+**Rate limits and the no-retry trade-off.** jev-1.13 allows 1200 requests/min and 250k tokens/s; output tokens are free, input is billed ($0.042/MTok at the time of writing). The gate never retries: a 429/529 (or any other failure) denies the call instead of adding tail latency to your tool pipeline. If you hit limits, the failure mode is "automode denies and tells you", never "automode hangs".
 
 ## Permissions and data
 
 | Surface | What this plugin does |
 |---|---|
 | Reads | Tool-call arguments under review; the session log (only to find the latest real user message as classifier intent) |
-| Writes | `$DSH_HOME/logs/automode.log` — a local JSON-lines audit file, best-effort; a write failure only logs a warning |
-| Network | Only when L1 is configured: the user message + tool call go to that LLM provider |
+| Writes | `$DSH_HOME/logs/auto-approval.log` — a local JSON-lines audit file, best-effort; a write failure only logs a warning |
+| Network | Only when L1 is configured. `llm` backend: the user message + tool call go to that LLM provider. `jev` backend (off by default): the **latest real user message** (truncated to 4000 chars), the **tool name**, and the **arguments JSON** (truncated to 8000 chars) go to `https://api.typesafe.ai/v1/systemone`. **Tool output is never sent** on either backend — that is the injection defense, not a coincidence |
 | Executes | Nothing. No subprocess, no shell, no file mutation outside the audit log |
 | Intercepts | `tools/pre-execute` (prepended) plus a monotonic `ctx.tools.guard()` deny guard — both gated on the session's preset |
 | Failure bounds | L1 timeout / parse failure / missing model → **deny**; invalid config throws at load (fail-loud); a missing settings service falls back to the composition entry config |
 
 ## Compatibility
 
-Tracks the latest official DeepSeek Harness release. Currently verified against `@deepseek-ai/dsh` **0.1.2-rc.1** (install → boot → real tool-call decision in a disposable `DSH_HOME`). Older releases are not supported.
+Tracks the latest official DeepSeek Harness release. Verified against `@deepseek-ai/dsh` **0.1.2-rc.1** and **0.1.5-rc.2** (install → boot → real tool-call decision in a disposable `DSH_HOME`). Older releases are not supported.
 
 The bundle patch restates the official preset table, so a base release that adds a preset needs this file updated too.
 
