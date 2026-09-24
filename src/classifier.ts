@@ -13,8 +13,8 @@
  * @module dsh-auto-approval/classifier
  */
 
-import { BlockAssembler, createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
-import type { GenerateOptions, Message, StreamChunk } from '@deepseek-ai/dsh-llm'
+import { BlockAssembler, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, RequestUserInput, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { deepFreeze } from '@deepseek-ai/dsh-util-values'
 import { deadline } from '@deepseek-ai/dsh-timeout'
 import type { ModelRoute, ResolvedLlmClassifierConfig } from './config.ts'
@@ -110,10 +110,9 @@ async function callModel(
   stage: string,
   acceptTruncated = false,
 ): Promise<string> {
-  const messages: Message[] = [createUserMessage({
-    content: [{ type: 'text', text: userText }],
-    source: { kind: 'plugin', plugin: 'dsh-auto-approval' },
-  })]
+  // DSH 0.1.7 removed the shared `{ kind: 'plugin' }` message source: one-shot
+  // callers pass an identity-free request-only user input (no id, no source).
+  const messages: RequestUserInput[] = [{ role: 'user', content: [{ type: 'text', text: userText }] }]
   const callDeadline = deadline(upstream, timeoutMs, 'AUTO_APPROVAL_CLASSIFIER_TIMEOUT')
   try {
     const options: GenerateOptions = deepFreeze({

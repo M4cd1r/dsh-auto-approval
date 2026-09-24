@@ -6,6 +6,11 @@
  * because the remote is a small hand-curated surface and the generator is a
  * whole-workspace analyzer.
  *
+ * DURABLE CONSTRAINT (DSH 0.1.7): the Typert loader/gateway requires a
+ * `create()` factory on every strict codec and validates wire values through
+ * `codec.create().parse(value)` at the boundary — a bare `schema` property is
+ * not part of the `TypertCodec` contract.
+ *
  * WHY a strict manifest instead of SRC fallback: the gateway's SRC fallback
  * discovers `@Remote` methods through the `remoteMethods` marker WeakMap — a
  * module-level table that must be the SAME `@deepseek-ai/dsh-typert-protocol`
@@ -57,7 +62,7 @@ const agentParameter = {
   codec: {
     mode: 'strict',
     typeSymbol: '@deepseek-ai/dsh-session/types#SessionId',
-    schema: sessionIdSchema,
+    create: () => sessionIdSchema,
   },
 } as const
 
@@ -74,7 +79,7 @@ const descriptors: InvocationDescriptor[] = [
     result: {
       mode: 'strict',
       typeSymbol: 'dsh-auto-approval#AutomodeStatus',
-      schema: statusSchema,
+      create: () => statusSchema,
     },
   },
   {
@@ -88,7 +93,7 @@ const descriptors: InvocationDescriptor[] = [
     result: {
       mode: 'strict',
       typeSymbol: 'dsh-auto-approval#DecisionRecord[]',
-      schema: z.array(decisionRecordSchema).readonly(),
+      create: () => z.array(decisionRecordSchema).readonly(),
     },
   },
 ]

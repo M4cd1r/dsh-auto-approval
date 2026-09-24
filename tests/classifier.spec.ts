@@ -3,6 +3,7 @@ import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
 import { classifyL1 } from '../src/classifier.ts'
 import type { LlmLike } from '../src/classifier.ts'
 import type { ResolvedClassifierConfig } from '../src/config.ts'
+import { frameCall } from '../src/frame.ts'
 
 const CONFIG: ResolvedClassifierConfig = {
   backend: 'llm',
@@ -46,6 +47,18 @@ describe('classifyL1 两阶段判定', () => {
     expect(llm.calls[0]?.model).toBe('fast-m')
     expect(llm.calls[0]?.maxTokens).toBe(16)
     expect(llm.calls[0]?.reasoningEffort).toBe('off')
+  })
+
+  it('sends an identity-free request-only user input (no id, no source)', async () => {
+    const llm = stubLlm('0')
+    await classifyL1(llm, CONFIG, INPUT)
+    const messages = llm.calls[0]?.messages
+    expect(messages).toHaveLength(1)
+    const first = messages?.[0] as Record<string, unknown>
+    expect(first.role).toBe('user')
+    expect(first.content).toEqual([{ type: 'text', text: frameCall(INPUT) }])
+    expect('id' in first).toBe(false)
+    expect('source' in first).toBe(false)
   })
 
   it('Stage 1 max-tokens 截断但首字符为 0 → 仍直接 allow（截断不影响首字符判定）', async () => {

@@ -7,6 +7,11 @@
  * standalone repo hand-writes it because the remote is a small hand-curated
  * surface and the generator is a whole-workspace TypeScript analyzer.
  *
+ * DURABLE CONSTRAINT (DSH 0.1.7): the Typert loader/gateway requires a
+ * `create()` factory on every strict codec and validates wire values through
+ * `codec.create().parse(value)` at the boundary — a bare `schema` property is
+ * not part of the `TypertCodec` contract.
+ *
  * Two halves must stay in lockstep with the host service
  * (`dsh-auto-approval/src/remote.ts`):
  * - the wire schemas (hand-rolled strict parsers in `./schema.ts`) must parse
@@ -40,7 +45,7 @@ const agentParameter = {
   codec: {
     mode: 'strict',
     typeSymbol: '@deepseek-ai/dsh-session/types#SessionId',
-    schema: sessionIdSchema,
+    create: () => sessionIdSchema,
   },
 } as const
 
@@ -62,7 +67,7 @@ export const TYPERT_REMOTE: TypertRemoteContribution = {
       result: {
         mode: 'strict',
         typeSymbol: 'dsh-auto-approval#AutomodeStatus',
-        schema: statusSchema,
+        create: () => statusSchema,
       },
     },
     {
@@ -76,7 +81,7 @@ export const TYPERT_REMOTE: TypertRemoteContribution = {
       result: {
         mode: 'strict',
         typeSymbol: 'dsh-auto-approval#DecisionRecord[]',
-        schema: decisionListSchema,
+        create: () => decisionListSchema,
       },
     },
   ],

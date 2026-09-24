@@ -1,68 +1,74 @@
 /**
- * 本 turn deny 计数（per agent）：给 remote/chip 显示"当前 turn 累计被
- * deny 次数"。
+ * Per-turn deny counter (per agent): feeds the remote/chip's "denials this
+ * turn" display.
  *
- * turn 边界不从 agent 事件订阅，而是惰性读 session log 里最后一个
- * `turn/start`——append-only、seq 连续的 log 配上扫描游标，每次同步是
- * O(增量事件数)，且不存在订阅漏接/时序漂移问题。
+ * Since DSH 0.1.7 the turn boundary is no longer derived lazily from the
+ * session log (synchronous history reads are deprecated): a constructor-
+ * injected turn reader supplies it instead — the `lastTurn` value of the
+ * `turnBoundary` projection (the unit dsh-agent-loop registers). When the
+ * reader returns undefined (this composition has no turnBoundary projection)
+ * there is no reliable boundary, so the tracker reports 0 and does not count:
+ * leaking a count across turns is worse than having no count. Cumulative
+ * statistics stay owned by DecisionHistory and are unaffected.
  *
- * 无 agent 的调用（`exec.agent === undefined`）拿不到 session，fail-closed：
- * 不参与计数。
+ * A call without an agent (`exec.agent === undefined`) has no session and
+ * fails closed: it does not participate in counting.
  * @module dsh-auto-approval/tracker
  */
 
-import type { SessionEvent } from '@deepseek-ai/dsh-session'
-
-/** tracker 依赖的最小 agent 结构（structural typing，测试可直接 mock）。 */
+/** Minimal agent shape the tracker needs (structural typing; tests mock it directly). */
 export interface AgentLike {
-  readonly session: {
-    snapshotEvents(): readonly SessionEvent[]
-  }
+  readonly session: object
 }
 
+/** Reads the current turn number for one agent's session; undefined when no reliable boundary exists. */
+export type TurnReader = (agent: AgentLike) => number | undefined
+
 interface AgentState {
-  /** 最近一次同步看到的 turn 号；-1 = 尚未看到任何 turn/start。 */
+  /** Turn number seen at the latest read. */
   turn: number
-  /** 当前 turn 内被本插件 deny 的次数。 */
+  /** Times this plugin denied a call within the current turn. */
   denials: number
-  /** session log 的扫描游标（log append-only，游标只会前进）。 */
-  cursor: number
 }
 
 export class DenialTracker {
   private readonly states = new WeakMap<object, AgentState>()
 
+  constructor(private readonly readTurn: TurnReader) {}
+
   /**
-   * 同步 agent 的 turn 状态：从游标处扫到 log 末尾，遇到 turn 号变化即
-   * 清零 deny 计数（新 turn = 新的用户意图上下文，计数重新起算）。
+   * Sync one agent's turn state: a new turn reported by the reader resets the
+   * deny counter (a new turn is a new user-intent context, so the count starts
+   * over). A reader returning undefined drops that agent's state and returns
+   * undefined (no reliable boundary → no counting).
    */
-  private sync(agent: AgentLike): AgentState {
+  private sync(agent: AgentLike): AgentState | undefined {
+    const turn = this.readTurn(agent)
+    if (turn === undefined) {
+      this.states.delete(agent)
+      return undefined
+    }
     let state = this.states.get(agent)
     if (state === undefined) {
-      state = { turn: -1, denials: 0, cursor: 0 }
+      state = { turn, denials: 0 }
       this.states.set(agent, state)
+    } else if (turn !== state.turn) {
+      state.turn = turn
+      state.denials = 0
     }
-    const events = agent.session.snapshotEvents()
-    for (let seq = state.cursor; seq < events.length; seq++) {
-      const event = events[seq]
-      if (event !== undefined && event.type === 'turn/start' && event.data.turn !== state.turn) {
-        state.turn = event.data.turn
-        state.denials = 0
-      }
-    }
-    state.cursor = events.length
     return state
   }
 
-  /** 该 agent 当前 turn 内累计被 deny 的次数（无 agent 返回 0）。 */
+  /** Denials recorded within the agent's current turn (0 without an agent or a turn boundary). */
   denials(agent: AgentLike | undefined): number {
     if (agent === undefined) return 0
-    return this.sync(agent).denials
+    return this.sync(agent)?.denials ?? 0
   }
 
-  /** 记录一次本插件发出的 deny。无 agent 的调用不计数。 */
+  /** Record one deny emitted by this plugin; calls without an agent or a reliable turn boundary do not count. */
   recordDenial(agent: AgentLike | undefined): void {
     if (agent === undefined) return
-    this.sync(agent).denials += 1
+    const state = this.sync(agent)
+    if (state !== undefined) state.denials += 1
   }
 }

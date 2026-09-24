@@ -67,8 +67,16 @@ export interface Config {
   jevAllowThreshold?: number
 }
 
-/** Runtime configuration schema (schemastery fills defaults before construction). */
-export const Config: z<Config> = z.object({
+/**
+ * The profile row's Config schema (schemastery fills defaults before
+ * construction). Since DSH 0.1.7 every field is `volatile()`: the Host serves
+ * exactly these fields as the plugin's Settings form, commits edits into the
+ * running activation's references, and emits `loader/volatile-update` without
+ * remounting. Unannotated on purpose: `.volatile()` rewrites each field's
+ * output into its reference form, which the plain `z<Config>` annotation
+ * rejects (dsh-usage pattern).
+ */
+export const Config = z.object({
   denyPatterns: z.array(z.string()).default([
     // 系统级破坏性操作
     'rm\\s+(-[a-z]*[fr][a-z]*\\s+)*/\\s*$',
@@ -78,7 +86,7 @@ export const Config: z<Config> = z.object({
     // **防御规则**误报成插件自己的下载执行行为（且 bundler 不会把字符类折回 `|`）。
     'curl\\s+[^|]*\\x7c\\s*(ba)?sh',
     'wget\\s+[^|]*\\x7c\\s*(ba)?sh',
-  ]),
+  ]).volatile(),
   askPatterns: z.array(z.string()).default([
     // 写工作区外的系统路径
     'sudo\\s',
@@ -92,28 +100,84 @@ export const Config: z<Config> = z.object({
     'git\\s+clean\\s+-[a-z]*[fd][a-z]*',
     'drop\\s+table',
     'DROP\\s+TABLE',
-  ]),
+  ]).volatile(),
   autoApproveTools: z.array(z.string()).default([
     // 只读工具
     'read', 'read_image', 'grep', 'find', 'ls', 'list_files', 'glob', 'search_symbols',
     // 文件写入工具：写代码/改文件有独立审查（代码 review + 沙箱边界），AA 不重复检查
     'write', 'edit', 'str_replace_editor',
-  ]),
-  selfKillGuard: z.boolean().default(true),
-  auditSessionEvents: z.boolean().default(false),
-  bashCommandPrefixes: z.array(z.string()).default([]),
-  classifierFastProvider: z.string(),
-  classifierFastModel: z.string(),
-  classifierDeepProvider: z.string(),
-  classifierDeepModel: z.string(),
-  classifierTimeoutMs: z.number().default(20_000),
-  classifierGuidance: z.string(),
-  classifierBackend: z.union(['llm', 'jev']).default('llm'),
-  jevApiKey: z.string(),
-  jevBaseUrl: z.string(),
-  jevModel: z.string().default('jev-latest'),
-  jevAllowThreshold: z.number().default(0.9),
+  ]).volatile(),
+  selfKillGuard: z.boolean().default(true).volatile(),
+  auditSessionEvents: z.boolean().default(false).volatile(),
+  bashCommandPrefixes: z.array(z.string()).default([]).volatile(),
+  classifierFastProvider: z.string().volatile(),
+  classifierFastModel: z.string().volatile(),
+  classifierDeepProvider: z.string().volatile(),
+  classifierDeepModel: z.string().volatile(),
+  classifierTimeoutMs: z.number().default(20_000).volatile(),
+  classifierGuidance: z.string().volatile(),
+  classifierBackend: z.union(['llm', 'jev']).default('llm').volatile(),
+  jevApiKey: z.string().volatile(),
+  jevBaseUrl: z.string().volatile(),
+  jevModel: z.string().default('jev-latest').volatile(),
+  jevAllowThreshold: z.number().default(0.9).volatile(),
 })
+
+/** One volatile field reference the Host hands to an activation (dsh-usage pattern). */
+export interface ConfigRef<T> {
+  get(): T | undefined
+}
+
+/** A config field as the activation sees it: a live reference, a plain value, or absent. */
+export type ConfigField<T> = ConfigRef<T> | T | undefined
+
+/**
+ * The activation's raw config fields: every field is optional and may arrive
+ * as the live volatile reference the Host commits profile-entry edits into.
+ * Field-by-field semantics are documented on {@link Config} above; this shape
+ * only widens each field with the reference union.
+ */
+export interface ConfigFields {
+  denyPatterns?: ConfigField<string[]>
+  selfKillGuard?: ConfigField<boolean>
+  auditSessionEvents?: ConfigField<boolean>
+  askPatterns?: ConfigField<string[]>
+  autoApproveTools?: ConfigField<string[]>
+  bashCommandPrefixes?: ConfigField<string[]>
+  classifierFastProvider?: ConfigField<string>
+  classifierFastModel?: ConfigField<string>
+  classifierDeepProvider?: ConfigField<string>
+  classifierDeepModel?: ConfigField<string>
+  classifierTimeoutMs?: ConfigField<number>
+  classifierGuidance?: ConfigField<string>
+  classifierBackend?: ConfigField<'llm' | 'jev'>
+  jevApiKey?: ConfigField<string>
+  jevBaseUrl?: ConfigField<string>
+  jevModel?: ConfigField<string>
+  jevAllowThreshold?: ConfigField<number>
+}
+
+/**
+ * Read one activation field: a volatile ref goes through `get()`, a plain
+ * value passes through, and an absent/undefined/null field falls back to the
+ * schema default (the schema fills it in the next step).
+ */
+function readField<T>(field: ConfigField<T>): T | undefined {
+  if (field === undefined || field === null) return undefined
+  const ref = field as { get?: () => T | undefined }
+  const value = typeof ref.get === 'function' ? ref.get() : (field as T)
+  return value === undefined || value === null ? undefined : value
+}
+
+/** Materialize volatile refs into the plain shape the schema expects (absent keys keep schema defaults). */
+function materialize(fields: ConfigFields): Record<string, unknown> {
+  const plain: Record<string, unknown> = {}
+  for (const [key, field] of Object.entries(fields)) {
+    const value = readField(field as ConfigField<unknown>)
+    if (value !== undefined) plain[key] = value
+  }
+  return plain
+}
 
 /** 一个具体的模型路由（ctx.llm 要求 provider + model 成对）。 */
 export interface ModelRoute {
@@ -214,19 +278,29 @@ function resolveRoute(
 }
 
 /**
- * 解析并校验配置。schema 先填默认值，这里做 schema 表达不了的校验；
- * 任一违规 throw（插件加载失败优于运行时静默放行）。
+ * Resolve and validate the configuration. Volatile refs are materialized into
+ * plain values first (a ref reads `get()`; undefined/null falls back to the
+ * schema default), the schema fills the remaining defaults, and the checks the
+ * schema cannot express run last; any violation throws (a plugin that fails to
+ * load beats silently degrading at runtime). Plain-value callers (every
+ * existing test) keep their previous behavior.
  *
- * 语义变迁（全托管）：`askPatterns` 字段保留以兼容旧配置，但命中即
- * **deny**——插件初衷是无人介入的全托管，不确定的调用直接拒绝而非转
- * 人工。`ask` 在 resolved 里与 deny 同义，只保留列表独立以便审计区分来源。
- * @param config - Loader 或测试传入的原始配置。
- * @returns 不可变的解析后配置。
+ * Managed-mode semantics: `askPatterns` is kept only for old-config
+ * compatibility, but a hit is a **deny** — this plugin is fully managed with
+ * no human hand-off, so an uncertain call is rejected instead of escalated.
+ * `ask` is synonymous with deny in the resolved config; the list stays
+ * separate only so the audit can distinguish the source.
+ * @param config - Raw configuration from the Loader or tests (volatile fields arrive as refs).
+ * @returns The immutable resolved configuration.
  */
-export function resolveConfig(config: Config = {}): ResolvedConfig {
-  // schema 已填默认值；类型上字段仍可选（z<Config> 的输出类型），这里一次性
-  // 收窄（与上游 "schema defaults + ?? narrows" 惯例同义，只是集中在一处）。
-  const resolved = Config(config) as Config & {
+export function resolveConfig(config: ConfigFields = {}): ResolvedConfig {
+  // Materialize in two passes: first the caller's volatile refs to plain
+  // values, then — because a volatile schema returns every field as a ref
+  // (absent keys reference the schema default) — a second pass yields the
+  // plain object. The cast keeps the existing "schema defaults + ?? narrows"
+  // convention, just centralized in one place.
+  const withDefaults = Config(materialize(config)) as unknown as ConfigFields
+  const resolved = materialize(withDefaults) as unknown as Config & {
     enabled: boolean
     denyPatterns: string[]
     askPatterns: string[]

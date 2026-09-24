@@ -76,20 +76,22 @@ pnpm --dir "$DSH_HOME/profiles/web" up dsh-auto-approval
 
 ## 配置
 
-`$DSH_HOME/settings.yaml`，热重载：
+配置就是本插件的 profile entry——在 Web UI 的 **Settings → Plugins** 里编辑，或直接手改 `$DSH_HOME/profiles/web/cordis.patch.yml`。DSH 0.1.7 起这些字段是 volatile 的：改动热生效到运行中的会话（不重挂载）；非法的在线更新会被拒绝并保留上一份好配置。旧的 `$DSH_HOME/settings.yaml` 会被 DSH 一次性导入后改名：
 
 ```yaml
-auto-approval:
-  denyPatterns:
-    - 'rm\s+(-[a-z]*[fr][a-z]*\s+)*/\s*$'
-    - 'curl\s+[^|]*\x7c\s*(ba)?sh'
-  autoApproveTools: [read, write, edit, glob, grep, ls]
-  bashCommandPrefixes: [ls, pwd, git status, git diff, pnpm test]
-  classifierFastProvider: deepseek-official
-  classifierFastModel: deepseek-v4-flash
-  classifierDeepProvider: deepseek-official
-  classifierDeepModel: deepseek-v4-pro
-  classifierGuidance: '只读命令和跑测试优先放行。'
+- id: auto-approval
+  name: dsh-auto-approval
+  config:
+    denyPatterns:
+      - 'rm\s+(-[a-z]*[fr][a-z]*\s+)*/\s*$'
+      - 'curl\s+[^|]*\x7c\s*(ba)?sh'
+    autoApproveTools: [read, write, edit, glob, grep, ls]
+    bashCommandPrefixes: [ls, pwd, git status, git diff, pnpm test]
+    classifierFastProvider: deepseek-official
+    classifierFastModel: deepseek-v4-flash
+    classifierDeepProvider: deepseek-official
+    classifierDeepModel: deepseek-v4-pro
+    classifierGuidance: '只读命令和跑测试优先放行。'
 ```
 
 所有键都可选。`denyPatterns` / `autoApproveTools` / `bashCommandPrefixes` 是**整体替换**默认值（YAML 数组不合并），要保留的默认项得自己写全。
@@ -112,7 +114,7 @@ auto-approval:
   jevAllowThreshold: 0.9      # 默认值；必须落在开区间 (0, 1)
 ```
 
-超时复用 `classifierTimeoutMs`，不新增键。不要把 `classifierBackend: jev` 和 `classifierFast*`/`classifierDeep*` 路由同时配置——歧义配置在加载期直接 throw（fail-loud）。密钥从 `jevApiKey` 解析，缺省回退 `TYPESAFE_API_KEY` 环境变量。**警告：`jevApiKey` 写进 settings.yaml 就是明文落盘——优先用环境变量。** 密钥永不出现在日志、审计事件或 deny reason 里。
+超时复用 `classifierTimeoutMs`，不新增键。不要把 `classifierBackend: jev` 和 `classifierFast*`/`classifierDeep*` 路由同时配置——歧义配置在加载期直接 throw（fail-loud）。密钥从 `jevApiKey` 解析，缺省回退 `TYPESAFE_API_KEY` 环境变量。**警告：`jevApiKey` 写进 profile patch 就是明文落盘——优先用环境变量。** 密钥永不出现在日志、审计事件或 deny reason 里。
 
 **一个闸门，四个证人。** 一次请求问五个问题，只有 `clearly_safe` 参与判定：`noul ≥ jevAllowThreshold` 放行，否则拒绝。`destructive`、`exfiltration`、`beyond_scope`、`impact` **只记录、不拦**——它们的合理阈值必须在你自己的真实 session 上量出来（分类器阈值跨数据集不迁移是普遍教训），先读几十条真实判定日志里的信号分布，再决定要不要升格为闸门。每条 Jev 判定都会在文件日志里写一行，含五个信号数值、`usage.input_tokens` 和实际回答的模型版本号。
 
@@ -122,18 +124,18 @@ auto-approval:
 
 | 面 | 本插件做什么 |
 |---|---|
-| 读 | 待判定的工具调用参数；session log（仅用于取最近一条真实用户消息作为分类器意图） |
+| 读 | 待判定的工具调用参数；session 的 `autoApprovalIntent` projection（仅用于取最近一条真实用户消息作为分类器意图） |
 | 写 | `$DSH_HOME/logs/auto-approval.log`——本机 JSONL 审计文件，best-effort；写失败只记 warn |
 | 网络 | 仅当配置了 L1。`llm` backend：用户消息 + 工具调用发给所配置的模型服务。`jev` backend（默认关闭）：**最近一条真实用户消息**（截断到 4000 字）、**tool 名**、**参数 JSON**（截断到 8000 字）发往 `https://api.typesafe.ai/v1/systemone`。两个 backend 都**永不发送 tool 输出**——这是注入防线，不是巧合 |
 | 执行 | 不执行任何东西。不起子进程、不走 shell、不改审计文件以外的文件 |
 | 拦截 | `tools/pre-execute`（prepend）+ 单调 `ctx.tools.guard()` deny 守卫，两者都按会话 preset 门控 |
-| 失败边界 | L1 超时 / 解析失败 / 无模型 → **deny**；配置非法在加载时 throw（fail-loud）；settings 服务缺失回退 composition entry 配置 |
+| 失败边界 | L1 超时 / 解析失败 / 无模型 → **deny**；配置非法在加载时 throw（fail-loud）；配置来自 profile entry，非法的在线更新保留上一份好配置 |
 
 ## 兼容性
 
-只跟官方最新版走。已在 `@deepseek-ai/dsh` **0.1.2-rc.1** 和 **0.1.5-rc.2** 上实测通过（一次性 `DSH_HOME`：安装 → 启动 → 真实 tool call 判定）。旧版本不保证。
+只跟官方最新版走。已在 `@deepseek-ai/dsh` **0.1.7-rc.1** 上实测通过（一次性 `DSH_HOME`：安装 → 启动 → 真实 tool call 判定）。旧版本（0.1.5 及以下）不保证。
 
-bundle patch 会整体重述官方 preset 表，所以官方基础层新增 preset 时这个文件也要跟着更新。
+bundle patch 会整体重述官方 preset 表，所以官方基础层新增 preset 时这个文件也要跟着更新。注意：你自己的 profile patch 是更上层的层——如果它重述了 `permission` 行，必须把 `automode` preset 自己写进去（后层覆盖本包的 bundle patch），且 `defaultPreset` 归用户所有。
 
 ## 开发
 

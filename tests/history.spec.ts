@@ -1,12 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { DecisionHistory } from '../src/history.ts'
 
 function fakeAgent(): Agent {
   const session = {
     id: 'session-h',
-    snapshotEvents: () => [] as SessionEvent[],
     append() {},
   }
   return { session } as unknown as Agent

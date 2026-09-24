@@ -76,20 +76,22 @@ If your `settings.yaml` has no classifier configured (`classifierFastProvider` /
 
 ## Configuration
 
-`$DSH_HOME/settings.yaml`, hot-reloaded:
+Configuration is the plugin's profile entry — edit it through **Settings → Plugins** in the web UI, or by hand in `$DSH_HOME/profiles/web/cordis.patch.yml`. Since DSH 0.1.7 the fields are volatile, so edits apply live to the running session (no remount); an invalid live update is rejected and keeps the last good config. A legacy `$DSH_HOME/settings.yaml` is imported by DSH once and renamed:
 
 ```yaml
-auto-approval:
-  denyPatterns:
-    - 'rm\s+(-[a-z]*[fr][a-z]*\s+)*/\s*$'
-    - 'curl\s+[^|]*\x7c\s*(ba)?sh'
-  autoApproveTools: [read, write, edit, glob, grep, ls]
-  bashCommandPrefixes: [ls, pwd, git status, git diff, pnpm test]
-  classifierFastProvider: deepseek-official
-  classifierFastModel: deepseek-v4-flash
-  classifierDeepProvider: deepseek-official
-  classifierDeepModel: deepseek-v4-pro
-  classifierGuidance: 'Prefer allowing read-only and test commands.'
+- id: auto-approval
+  name: dsh-auto-approval
+  config:
+    denyPatterns:
+      - 'rm\s+(-[a-z]*[fr][a-z]*\s+)*/\s*$'
+      - 'curl\s+[^|]*\x7c\s*(ba)?sh'
+    autoApproveTools: [read, write, edit, glob, grep, ls]
+    bashCommandPrefixes: [ls, pwd, git status, git diff, pnpm test]
+    classifierFastProvider: deepseek-official
+    classifierFastModel: deepseek-v4-flash
+    classifierDeepProvider: deepseek-official
+    classifierDeepModel: deepseek-v4-pro
+    classifierGuidance: 'Prefer allowing read-only and test commands.'
 ```
 
 Every key is optional. `denyPatterns` / `autoApproveTools` / `bashCommandPrefixes` **replace** the defaults wholesale (YAML arrays do not merge), so restate the values you want to keep.
@@ -112,7 +114,7 @@ auto-approval:
   jevAllowThreshold: 0.9      # default; must be in the open interval (0, 1)
 ```
 
-`classifierTimeoutMs` is reused as the per-request timeout — no new key. Do **not** combine `classifierBackend: jev` with `classifierFast*`/`classifierDeep*` routes: ambiguous configuration throws at load (fail-loud). The API key resolves from `jevApiKey` first, then `TYPESAFE_API_KEY`. **Warning: `jevApiKey` in settings.yaml is stored in plaintext — prefer the environment variable.** The key never appears in logs, audit events, or deny reasons.
+`classifierTimeoutMs` is reused as the per-request timeout — no new key. Do **not** combine `classifierBackend: jev` with `classifierFast*`/`classifierDeep*` routes: ambiguous configuration throws at load (fail-loud). The API key resolves from `jevApiKey` first, then `TYPESAFE_API_KEY`. **Warning: `jevApiKey` in the profile patch is stored in plaintext — prefer the environment variable.** The key never appears in logs, audit events, or deny reasons.
 
 **One gate, four witnesses.** Of the five questions asked in the single request, only `clearly_safe` decides: `noul ≥ jevAllowThreshold` → allow, otherwise deny. `destructive`, `exfiltration`, `beyond_scope` and `impact` are **recorded, not enforced** — their useful thresholds have to be measured on your own real sessions (classifier thresholds do not transfer across datasets), so read a few dozen real decisions from the log's signal distributions before promoting any of them to a gate. Every Jev decision writes a file-log line with all five signal values, `usage.input_tokens`, and the actual model version that answered.
 
@@ -122,18 +124,18 @@ auto-approval:
 
 | Surface | What this plugin does |
 |---|---|
-| Reads | Tool-call arguments under review; the session log (only to find the latest real user message as classifier intent) |
+| Reads | Tool-call arguments under review; the session's `autoApprovalIntent` projection (only to find the latest real user message as classifier intent) |
 | Writes | `$DSH_HOME/logs/auto-approval.log` — a local JSON-lines audit file, best-effort; a write failure only logs a warning |
 | Network | Only when L1 is configured. `llm` backend: the user message + tool call go to that LLM provider. `jev` backend (off by default): the **latest real user message** (truncated to 4000 chars), the **tool name**, and the **arguments JSON** (truncated to 8000 chars) go to `https://api.typesafe.ai/v1/systemone`. **Tool output is never sent** on either backend — that is the injection defense, not a coincidence |
 | Executes | Nothing. No subprocess, no shell, no file mutation outside the audit log |
 | Intercepts | `tools/pre-execute` (prepended) plus a monotonic `ctx.tools.guard()` deny guard — both gated on the session's preset |
-| Failure bounds | L1 timeout / parse failure / missing model → **deny**; invalid config throws at load (fail-loud); a missing settings service falls back to the composition entry config |
+| Failure bounds | L1 timeout / parse failure / missing model → **deny**; invalid config throws at load (fail-loud); configuration comes from the profile entry, and an invalid live update keeps the last good config |
 
 ## Compatibility
 
-Tracks the latest official DeepSeek Harness release. Verified against `@deepseek-ai/dsh` **0.1.2-rc.1** and **0.1.5-rc.2** (install → boot → real tool-call decision in a disposable `DSH_HOME`). Older releases are not supported.
+Tracks the latest official DeepSeek Harness release. Verified against `@deepseek-ai/dsh` **0.1.7-rc.1** (install → boot → real tool-call decision in a disposable `DSH_HOME`). Older releases (0.1.5 and below) are not supported.
 
-The bundle patch restates the official preset table, so a base release that adds a preset needs this file updated too.
+The bundle patch restates the official preset table, so a base release that adds a preset needs this file updated too. Note that your own profile patch is a later layer: if it re-states the `permission` row, it must include the `automode` preset itself (later layers win over this package's bundle patch), and `defaultPreset` stays user-owned.
 
 ## Development
 

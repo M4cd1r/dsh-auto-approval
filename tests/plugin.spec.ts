@@ -2,35 +2,38 @@ import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import type { PreToolDecision, ToolExecution } from '@deepseek-ai/dsh-tools'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
-import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { apply } from '../src/index.ts'
+import type { ConfigFields } from '../src/config.ts'
 import { DENY_REASON } from '../src/rules.ts'
 import type { AutomodeDecisionEvent } from '../src/audit.ts'
 
+/** The fake session's projection-visible state: intent (autoApprovalIntent) and turn (turnBoundary). */
+interface FakeSession {
+  id: string
+  intent: string | null
+  lastTurn?: number
+  append(type: string, data: unknown): void
+}
+
 interface FakeAgent {
   agent: Agent
-  events: SessionEvent[]
+  session: FakeSession
   audited: Array<{ type: string; data: AutomodeDecisionEvent }>
 }
 
-function fakeAgent(events: SessionEvent[] = []): FakeAgent {
+let sessionSeq = 0
+/** Build an agent whose session the projection stub answers for; intent is a harness argument, not a log event. */
+function fakeAgent(intent: string | null = null): FakeAgent {
   const audited: FakeAgent['audited'] = []
-  const session = {
-    id: 'session-1',
-    snapshotEvents: () => events,
+  const session: FakeSession = {
+    id: `session-${++sessionSeq}`,
+    intent,
     append(type: string, data: unknown) {
       audited.push({ type, data: data as AutomodeDecisionEvent })
     },
   }
-  return { agent: { session } as unknown as Agent, events, audited }
-}
-
-function userMessage(text: string): SessionEvent {
-  return {
-    type: 'user/message', seq: 0, time: Date.now(),
-    data: { content: [{ type: 'text', text }], source: { kind: 'user' } },
-  } as unknown as SessionEvent
+  return { agent: { session } as unknown as Agent, session, audited }
 }
 
 let callSeq = 0
@@ -43,17 +46,51 @@ function makeExec(name: string, args: unknown, agent?: Agent): ToolExecution {
 
 const ALLOW: PreToolDecision = { kind: 'allow' }
 
+/** Let cordis attach inject callbacks (the projection registration lands in a microtask). */
+const flush = (): Promise<void> => new Promise(resolve => { setTimeout(resolve, 0) })
+
+/** The sessionProjections stub: register() gates stateOf(), values come from the fake session. */
+interface ProjectionStub {
+  registered: Set<string>
+  register(key: string): void
+}
+
+function provideProjections(ctx: Context): ProjectionStub {
+  const registered = new Set<string>()
+  const registry = {
+    register(definition: { key: string }) {
+      registered.add(definition.key)
+      return () => { registered.delete(definition.key) }
+    },
+    stateOf(session: unknown, key: string) {
+      if (!registered.has(key)) return undefined
+      const fake = session as FakeSession
+      if (key === 'autoApprovalIntent') return { intent: fake.intent ?? null }
+      if (key === 'turnBoundary') return { lastTurn: fake.lastTurn ?? 0 }
+      return undefined
+    },
+  }
+  ctx.provide('sessionProjections', registry)
+  return {
+    registered,
+    register: (key: string) => { registry.register({ key }) },
+  }
+}
+
 interface Harness {
   ctx: Context
   guards: Array<(exec: Readonly<ToolExecution>) => string | undefined>
+  projections: ProjectionStub
   run(exec: ToolExecution): Promise<PreToolDecision>
 }
 
-/** 建一个 cordis 根上下文，stub 掉 tools + permissionPresets，加载插件。
- * preset 默认 `automode`（插件生效）；传 undefined 模拟服务缺席（回退 session log）。
- * run() 未传 agent 时自动附上一个默认 agent——真实调用都有会话，而插件的开关
- * 是会话 preset，无会话时按设计不接管。 */
-function harness(config: Parameters<typeof apply>[1] = {}, preset: string | null = 'automode'): Harness {
+/** Build a Cordis root context, stub tools + permissionPresets +
+ * sessionProjections, and load the plugin. The preset defaults to `automode`
+ * (plugin active); passing undefined simulates an absent service (the plugin
+ * bypasses entirely). run() attaches a default agent when none is passed —
+ * real calls always have a session, and the plugin's switch is the session
+ * preset, so it by design takes over nothing without one. */
+function harness(config: ConfigFields = {}, preset: string | null = 'automode'): Harness {
   const ctx = new Context()
   const guards: Harness['guards'] = []
   ctx.provide('tools', {
@@ -63,15 +100,19 @@ function harness(config: Parameters<typeof apply>[1] = {}, preset: string | null
     },
   })
   if (preset !== null) ctx.provide('permissionPresets', { current: () => preset })
+  const projections = provideProjections(ctx)
   apply(ctx, config)
   const fallback = fakeAgent()
   return {
-    ctx, guards,
-    run: exec => ctx.waterfall(
-      'tools/pre-execute',
-      exec.agent === undefined ? { ...exec, agent: fallback.agent } : exec,
-      async (): Promise<PreToolDecision> => ALLOW,
-    ),
+    ctx, guards, projections,
+    run: async exec => {
+      await flush()
+      return ctx.waterfall(
+        'tools/pre-execute',
+        exec.agent === undefined ? { ...exec, agent: fallback.agent } : exec,
+        async (): Promise<PreToolDecision> => ALLOW,
+      )
+    },
   }
 }
 
@@ -115,13 +156,32 @@ describe('pre-execute 拦截（L0 规则引擎）', () => {
     expect(await run(makeExec('bash', { command: 'rm -rf /' }))).toBe(ALLOW)
   })
 
-  it('permissionPresets 服务缺席时回退 session log 的 permission/preset 事件', async () => {
-    const on = harness({ denyPatterns: ['preset-secret'] }, null)
-    const armed = fakeAgent([{ type: 'permission/preset', seq: 0, time: Date.now(), data: { preset: 'automode' } } as unknown as SessionEvent])
-    expect(await on.run(makeExec('bash', { command: 'preset-secret' }, armed.agent))).toMatchObject({ kind: 'deny' })
-    const off = harness({ denyPatterns: ['preset-secret'] }, null)
-    const manual = fakeAgent([{ type: 'permission/preset', seq: 0, time: Date.now(), data: { preset: 'workspace-write' } } as unknown as SessionEvent])
-    expect(await off.run(makeExec('bash', { command: 'preset-secret' }, manual.agent))).toBe(ALLOW)
+  it('bypasses entirely when the permissionPresets service is absent (no session-log fallback)', async () => {
+    const { run } = harness({ denyPatterns: ['preset-secret'] }, null)
+    const { agent } = fakeAgent('some intent')
+    expect(await run(makeExec('bash', { command: 'preset-secret' }, agent))).toBe(ALLOW)
+  })
+})
+
+describe('sessionProjections registration and reads', () => {
+  it('registers the autoApprovalIntent projection via the optional inject', async () => {
+    const { projections } = harness()
+    expect(projections.registered.has('autoApprovalIntent')).toBe(false)
+    await flush()
+    expect(projections.registered.has('autoApprovalIntent')).toBe(true)
+  })
+
+  it('denials in getStatus count per turn via the turnBoundary projection', async () => {
+    const harness_ = harness({ denyPatterns: ['forbidden'] })
+    const { agent } = fakeAgent()
+    await harness_.run(makeExec('bash', { command: 'forbidden' }, agent))
+    const service = harness_.ctx.get('automodeStatus') as unknown as { getStatus(agent: Agent): { denials: number } }
+    // turnBoundary not registered (dsh-agent-loop absent from the stub): no reliable boundary → 0.
+    expect(service.getStatus(agent).denials).toBe(0)
+    // Register turnBoundary as dsh-agent-loop would: the reader picks it up live.
+    harness_.projections.register('turnBoundary')
+    await harness_.run(makeExec('bash', { command: 'forbidden' }, agent))
+    expect(service.getStatus(agent).denials).toBe(1)
   })
 })
 
@@ -157,74 +217,73 @@ describe('escalation 参数（sandbox_permissions + justification）', () => {
   })
 })
 
-describe('settings 热更新（Web UI 开关）', () => {
-  /** stub settings 服务：installSection 捕获 hooks，flip 模拟 UI 写入。 */
-  function provideSettings(ctx: Context, initial: Record<string, unknown>): { flip(patch: Record<string, unknown>): void } {
-    let value = initial
-    const watchers: Array<() => void> = []
-    let validate: ((v: unknown) => void) | undefined
-    ctx.provide('settings', {
-      installSection(
-        _owner: unknown,
-        _ns: string,
-        _schema: unknown,
-        _entry: unknown,
-        hooks: { setSource(current: () => unknown): void; onChange(): void; validate?(v: unknown): void },
-      ) {
-        validate = hooks.validate
-        hooks.setSource(() => value)
-        validate?.(value)
-        watchers.push(() => hooks.onChange())
-      },
-    })
-    return {
-      flip(patch) {
-        const next = { ...value, ...patch }
-        // 真实服务在提交前跑 validate；坏写 throw，不提交、watcher 不触发
-        validate?.(next)
-        value = next
-        for (const cb of watchers) cb()
-      },
-    }
-  }
-
-  it('denyPatterns 热更新：新增规则立即拦截，移除后放行', async () => {
+describe('volatile config updates (loader/volatile-update)', () => {
+  function refHarness(patterns: () => string[], config: ConfigFields = {}) {
     const ctx = new Context()
     const guards: Array<(exec: Readonly<ToolExecution>) => string | undefined> = []
     ctx.provide('tools', {
       guard(g: (exec: Readonly<ToolExecution>) => string | undefined) { guards.push(g); return () => {} },
     })
     ctx.provide('permissionPresets', { current: () => 'automode' })
-    const settings = provideSettings(ctx, { denyPatterns: ['hot-secret'] })
-    apply(ctx, { denyPatterns: ['hot-secret'] })
-    const run = (exec: ToolExecution) => ctx.waterfall('tools/pre-execute', exec, async (): Promise<PreToolDecision> => ALLOW)
-    const agent = fakeAgent().agent
+    provideProjections(ctx)
+    apply(ctx, { denyPatterns: { get: patterns }, ...config })
+    const run = async (exec: ToolExecution) => {
+      await flush()
+      return ctx.waterfall('tools/pre-execute', exec, async (): Promise<PreToolDecision> => ALLOW)
+    }
+    const fire = () => { ctx.emit('loader/volatile-update', []) }
+    return { guards, run, fire }
+  }
 
-    const exec = () => makeExec('bash', { command: 'hot-secret' }, agent)
-    expect(await run(exec())).toMatchObject({ kind: 'deny' })
-    settings.flip({ denyPatterns: [] })
-    // L0 规则已移除：不再命中 deny；没有分类器时落到 L1-unconfigured（同样 deny，但原因不同）
-    expect(await run(exec())).toMatchObject({ kind: 'deny' })
-    // guard 同步热生效
-    expect(guards[0]?.(exec())).toBeUndefined()
-    settings.flip({ denyPatterns: ['hot-secret'] })
-    expect(await run(exec())).toMatchObject({ kind: 'deny' })
-    expect(guards[0]?.(exec())).toBe(DENY_REASON)
+  it('a denyPatterns ref update takes effect immediately on the waterfall and the monotonic guard', async () => {
+    let patterns = ['hot-secret']
+    const { guards, run, fire } = refHarness(() => patterns)
+    const agent = fakeAgent().agent
+    const exec = (command: string) => makeExec('bash', { command }, agent)
+
+    expect(await run(exec('hot-secret'))).toMatchObject({ kind: 'deny' })
+    expect(guards[0]?.(exec('hot-secret'))).toBe(DENY_REASON)
+
+    patterns = ['other-secret']
+    fire()
+    expect(await run(exec('other-secret'))).toMatchObject({ kind: 'deny' })
+    expect(guards[0]?.(exec('other-secret'))).toBe(DENY_REASON)
+    // The old pattern is gone from L0: without a classifier the call falls through to L1-unconfigured.
+    const decision = await run(exec('hot-secret'))
+    expect(decision).toMatchObject({ kind: 'deny' })
+    expect((decision as { reason?: string }).reason).toContain('no classifier is configured')
+    expect(guards[0]?.(exec('hot-secret'))).toBeUndefined()
   })
 
-  it('非法写入（坏正则）被 validate 拒绝，运行中的配置不变', async () => {
-    const ctx = new Context()
-    ctx.provide('tools', { guard: () => () => {} })
-    ctx.provide('permissionPresets', { current: () => 'automode' })
-    const settings = provideSettings(ctx, { denyPatterns: ['ok-pattern'] })
-    apply(ctx, { denyPatterns: ['ok-pattern'] })
-    const run = (exec: ToolExecution) => ctx.waterfall('tools/pre-execute', exec, async (): Promise<PreToolDecision> => ALLOW)
+  it('removing the deny patterns falls through to the L1-unconfigured deny', async () => {
+    let patterns = ['hot-secret']
+    const { guards, run, fire } = refHarness(() => patterns)
     const agent = fakeAgent().agent
-    // 先跑一次：注入回调在微任务里 attach，await 过后 validate 才已注册
-    expect(await run(makeExec('bash', { command: 'ok-pattern' }, agent))).toMatchObject({ kind: 'deny' })
-    expect(() => settings.flip({ denyPatterns: ['(broken'] })).toThrow(/invalid deny pattern/)
-    // 旧配置仍在生效
-    expect(await run(makeExec('bash', { command: 'ok-pattern' }, agent))).toMatchObject({ kind: 'deny' })
+    const exec = (command: string) => makeExec('bash', { command }, agent)
+
+    patterns = []
+    fire()
+    const decision = await run(exec('hot-secret'))
+    expect(decision).toMatchObject({ kind: 'deny' })
+    expect((decision as { reason?: string }).reason).toContain('no classifier is configured')
+    expect(guards[0]?.(exec('hot-secret'))).toBeUndefined()
+  })
+
+  it('an invalid update is rejected and the previous resolved config stays active', async () => {
+    let patterns = ['ok-pattern']
+    const { guards, run, fire } = refHarness(() => patterns, { auditSessionEvents: true })
+    const { agent, audited } = fakeAgent()
+    const exec = (command: string) => makeExec('bash', { command }, agent)
+
+    expect(await run(exec('ok-pattern'))).toMatchObject({ kind: 'deny' })
+
+    patterns = ['(broken']
+    fire()
+    // The rejected update must not take effect: the last good deny still matches (L0, not L1-unconfigured).
+    const decision = await run(exec('ok-pattern'))
+    expect(decision).toMatchObject({ kind: 'deny' })
+    expect(audited.at(-1)?.data).toMatchObject({ stage: 'L0-deny', decision: 'deny', pattern: 'ok-pattern' })
+    expect(guards[0]?.(exec('ok-pattern'))).toBe(DENY_REASON)
   })
 })
 
@@ -247,7 +306,7 @@ describe('L1 LLM classifier', () => {
 
   it('无 ctx.llm 服务 → fail-closed 转 deny', async () => {
     const { run } = harness({ ...fastRoute, auditSessionEvents: true })
-    const { agent, audited } = fakeAgent([userMessage('please deploy')])
+    const { agent, audited } = fakeAgent('please deploy')
     const decision = await run(makeExec('bash', { command: 'pnpm test' }, agent))
     expect(decision).toMatchObject({ kind: 'deny' })
     expect(audited.at(-1)?.data).toMatchObject({ stage: 'L1-fail-closed', decision: 'deny' })
@@ -263,7 +322,7 @@ describe('L1 LLM classifier', () => {
   it('fast 判定 0 → allow；审计含路由与阶段', async () => {
     const { ctx, run } = harness({ ...fastRoute, auditSessionEvents: true })
     provideLlm(ctx, '0')
-    const { agent, audited } = fakeAgent([userMessage('run the tests please')])
+    const { agent, audited } = fakeAgent('run the tests please')
     expect(await run(makeExec('bash', { command: 'pnpm test' }, agent))).toBe(ALLOW)
     expect(audited.at(-1)?.data).toMatchObject({
       stage: 'L1-fast', decision: 'allow', route: { provider: 'p', model: 'm' },
@@ -273,7 +332,7 @@ describe('L1 LLM classifier', () => {
   it('deep 判定 DENY → deny', async () => {
     const { ctx, run } = harness(fastRoute)
     provideLlm(ctx, '1', 'dangerous\nVERDICT: DENY')
-    const { agent } = fakeAgent([userMessage('delete everything')])
+    const { agent } = fakeAgent('delete everything')
     expect(await run(makeExec('bash', { command: 'rm -rf ./build' }, agent))).toMatchObject({ kind: 'deny' })
     // L1 deny 只进 tracker 计数，白名单工具照常放行（无 pause）
     expect(await run(makeExec('read', { path: 'x' }, agent))).toBe(ALLOW)
@@ -282,7 +341,7 @@ describe('L1 LLM classifier', () => {
   it('L1 解析失败 → fail-closed 转 deny（绝不默认放行）', async () => {
     const { ctx, run } = harness(fastRoute)
     provideLlm(ctx, '1', 'no verdict in this output')
-    const { agent } = fakeAgent([userMessage('do something')])
+    const { agent } = fakeAgent('do something')
     expect(await run(makeExec('bash', { command: 'curl example.com' }, agent))).toMatchObject({ kind: 'deny' })
   })
 })
@@ -292,6 +351,7 @@ describe('remote 状态 / 历史', () => {
     const ctx = new Context()
     ctx.provide('tools', { guard: () => () => {} })
     ctx.provide('permissionPresets', { current: () => 'automode' })
+    provideProjections(ctx)
     apply(ctx, { denyPatterns: ['forbidden'] })
     const run = (exec: ToolExecution) => ctx.waterfall('tools/pre-execute', exec, async (): Promise<PreToolDecision> => ALLOW)
     const { agent } = fakeAgent()
@@ -308,6 +368,7 @@ describe('remote 状态 / 历史', () => {
     const ctx = new Context()
     ctx.provide('tools', { guard: () => () => {} })
     ctx.provide('permissionPresets', { current: () => 'automode' })
+    provideProjections(ctx)
     apply(ctx, { denyPatterns: ['forbidden'] })
     const run = (exec: ToolExecution) => ctx.waterfall('tools/pre-execute', exec, async (): Promise<PreToolDecision> => ALLOW)
     const { agent } = fakeAgent()

@@ -94,6 +94,37 @@ describe('resolveConfig · jev backend', () => {
   })
 })
 
+describe('resolveConfig · volatile refs (0.1.7 profile config)', () => {
+  it('dereferences a ConfigRef value', () => {
+    const resolved = resolveConfig({ denyPatterns: { get: () => ['ref-secret'] } })
+    expect(resolved.denySources).toEqual(['ref-secret'])
+    expect(resolved.deny[0]?.source).toBe('ref-secret')
+  })
+
+  it('a ref whose get() returns undefined falls back to the schema default', () => {
+    const resolved = resolveConfig({
+      denyPatterns: { get: () => ['ref-secret'] },
+      selfKillGuard: { get: () => undefined },
+      jevModel: { get: () => undefined },
+    })
+    expect(resolved.selfKillGuard).toBe(true)
+    // jevModel is only observable through the jev backend route; assert via a
+    // resolved jev config instead.
+    const jev = resolveConfig({ classifierBackend: 'jev', jevApiKey: 'k', jevModel: { get: () => undefined } })
+    expect(jev.classifier).toMatchObject({ route: { model: 'jev-latest' } })
+    // The denyPatterns ref that did resolve is unaffected by the other defaults.
+    expect(resolved.denySources).toEqual(['ref-secret'])
+  })
+
+  it('an invalid ref value still throws the same fail-loud error', () => {
+    expect(() => resolveConfig({ denyPatterns: { get: () => ['(broken'] } }))
+      .toThrow(/invalid deny pattern/)
+    expect(() => resolveConfig({
+      classifierFastProvider: { get: () => 'p' },
+    })).toThrow(/together/)
+  })
+})
+
 describe('matchFirst / extractMatchableText', () => {
   it('返回第一个命中的下标', () => {
     const patterns = [/foo/, /bar/]

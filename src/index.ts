@@ -13,19 +13,23 @@
  * - L0 deny 同时走 `ctx.tools.guard()` 单调注册（M3），prepend 旁路不掉
  * - deny 的 reason 是通用文案，pattern 只进审计与日志（M2）
  * - 检测到 sandbox escalation 参数即豁免 L1，避免双重审批（M5）
- * - 本 turn deny 计数（tracker）从 session log 的 turn/start 惰性推导
+ * - Denial counting reads the `turnBoundary` projection (DSH 0.1.7 deprecated
+ *   synchronous session history scans)
  * - L1 一切失败 fail-closed 转 deny，绝不默认放行
  *
  * @module dsh-auto-approval
  */
 
 import { Context } from '@deepseek-ai/cordis'
+// Type-only: pulls the `loader/volatile-update` event declaration.
+import type {} from '@deepseek-ai/cordis-plugin-loader'
 import type { PreToolDecision, ToolExecution, ToolGuard } from '@deepseek-ai/dsh-tools'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Session } from '@deepseek-ai/dsh-session'
+import type { SessionProjectionRegistry } from '@deepseek-ai/dsh-session-projection'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
-import type {} from '@deepseek-ai/dsh-settings'
-import { Config, describeClassifier, resolveConfig } from './config.ts'
-import type { ResolvedConfig } from './config.ts'
+import { describeClassifier, resolveConfig } from './config.ts'
+import type { ConfigFields, ResolvedConfig } from './config.ts'
 import { classifyL1 } from './classifier.ts'
 import type { ClassifierOutcome, LlmLike } from './classifier.ts'
 import { classifyJev } from './jev.ts'
@@ -36,12 +40,19 @@ import { AutomodeStatusService } from './remote.ts'
 import type { HistoryReader, StatusReader } from './remote.ts'
 import { isAutomode } from './preset.ts'
 import { remoteManifest } from './remote-manifest.ts'
+import { autoApprovalIntentProjection } from './projection.ts'
 import { DenialTracker } from './tracker.ts'
+import type { AgentLike } from './tracker.ts'
 import { DecisionHistory } from './history.ts'
 
 export const name = 'auto-approval'
 
-/** settings 命名空间：settings.yaml 的 section 名，也是 Web UI 设置页的 section。 */
+/**
+ * Legacy settings namespace alias. Since DSH 0.1.7 the Settings surface keys
+ * one form per profile entry id (generated from this plugin's Config schema),
+ * so nothing reads this constant anymore; it stays exported as a public API
+ * for older companion code.
+ */
 export const NS = 'auto-approval'
 
 export { Config } from './config.ts'
@@ -56,24 +67,17 @@ const L1_FAILED_REASON = 'automode: automatic classifier failed; the call is den
 const L1_UNCONFIGURED_REASON = 'automode: no classifier is configured; only trusted tools and allowlisted commands may run. Configure classifierFastProvider/classifierFastModel to enable automode.'
 
 /**
- * 从 session log 提取最近一条真实用户消息的文本（L1 的意图输入）。
- * 只看 `source.kind === 'user'` 的消息：plugin 注入（ask-user 类工具的
- * 返回、agent.inject 上下文）都不算授权。往回扫到 log 开头为止；这条
- * 路径只在 L1 启用且未被 L0/白名单短路时走到，频率低，线性扫可接受。
+ * Read the latest real user message text (the L1 intent input) from the
+ * `autoApprovalIntent` projection — DSH 0.1.7 deprecated synchronous session
+ * history scans, so the fold unit in `projection.ts` replaces the old log
+ * scan (same semantics: only `source.kind === 'user'` messages count, plugin
+ * injections never authorize). Registry or key absent → undefined, and L1
+ * fails closed exactly as before.
  */
-function latestUserIntent(agent: Agent | undefined): string | undefined {
+function latestUserIntent(ctx: Context, agent: Agent | undefined): string | undefined {
   if (agent === undefined) return undefined
-  const events = agent.session.snapshotEvents()
-  for (let seq = events.length - 1; seq >= 0; seq--) {
-    const event = events[seq]
-    if (event === undefined || event.type !== 'user/message' || event.data.source.kind !== 'user') continue
-    const text = event.data.content
-      .map(block => block.type === 'text' ? block.text : `[${block.type} content]`)
-      .join('\n')
-      .trim()
-    if (text.length > 0) return text
-  }
-  return undefined
+  const registry = ctx.get('sessionProjections') as SessionProjectionRegistry | undefined
+  return registry?.stateOf(agent.session, 'autoApprovalIntent')?.intent ?? undefined
 }
 
 /** 一次调用的决策上下文：tracker/audit 共用的 agent 与 callId 提取。 */
@@ -82,27 +86,35 @@ function callFacts(exec: ToolExecution): { agent: Agent | undefined; callId: str
 }
 
 /**
- * 插件入口：挂载 `tools/pre-execute` 瀑布（prepend 最先跑）+ L0 deny 的
- * 单调 guard。配置非法直接 throw（fail-loud，M1）。
+ * Plugin entry: mounts the `tools/pre-execute` waterfall (prepend runs first)
+ * plus the monotonic L0 deny guard. Invalid configuration throws at load
+ * (fail-loud, M1).
  *
- * **开关是权限 preset，不是插件设置**：只有会话处于 `automode` preset
- * （本 bundle 的 patch 往官方 preset 表里加的第四档）时才生效；选其它
- * preset 即完全旁路。这样用户可见的模型是 3 + 1：三档沙箱 + 一档“全托管”。
+ * **The switch is a permission preset, not a plugin setting**: the plugin only
+ * takes over while the session runs the `automode` preset (the fourth entry
+ * this bundle's patch adds to the official preset table); selecting any other
+ * preset bypasses it entirely. The user-visible model stays 3 + 1: three
+ * sandbox tiers plus one fully-managed tier.
  *
- * 配置走 `ctx.settings.installSection`（settings 命名空间 `auto-approval`，
- * 只含分类器配置）：composition entry 是 base 层，`$DSH_HOME/settings.yaml`
- * 的 `automode:` section 是 user 层，改动热生效。`validate` 钩子让带非法
- * 正则 / 不成对路由的写在提交前被拒（fail-loud）。settings 服务缺席的
- * 组合（如 headless）自动回退 entry config。
+ * Since DSH 0.1.7 the configuration is the profile entry's `config` (edited in
+ * Settings → Plugins, or by hand in `$DSH_HOME/profiles/web/cordis.patch.yml`):
+ * the Host builds the form from this plugin's own Config schema (all fields
+ * volatile), commits edits into the running references, and emits
+ * `loader/volatile-update` — live, without a remount. Volatile fields reach
+ * `apply` as refs; every event re-resolves the whole config, and an invalid
+ * update (bad regex, unpaired route, out-of-range threshold) is rejected while
+ * the last good config stays armed — access is never silently widened.
  */
-export function apply(ctx: Context, config: Config = {}): void {
-  let current: () => Config = () => config
+export function apply(ctx: Context, config: ConfigFields = {}): void {
   let resolved: ResolvedConfig = resolveConfig(config)
-  let tracker = new DenialTracker()
+  /** Reads the current turn from the `turnBoundary` projection (dsh-agent-loop's unit); undefined without it. */
+  const readTurn = (agent: AgentLike): number | undefined => {
+    const registry = ctx.get('sessionProjections') as SessionProjectionRegistry | undefined
+    return registry?.stateOf(agent.session as Session, 'turnBoundary')?.lastTurn
+  }
+  let tracker = new DenialTracker(readTurn)
   const history = new DecisionHistory()
   const logger = ctx.logger('auto-approval')
-
-  /** settings provider 引用（仅用于 arm 日志判断是否已挂 settings）。 */
 
   /** 本次工具调用是否处于 automode preset 下（无 session 则不接管）。 */
   const gated = (agent: Agent | undefined): boolean => isAutomode(ctx, agent?.session)
@@ -179,25 +191,34 @@ export function apply(ctx: Context, config: Config = {}): void {
     })
   }
 
-  let settingsAttached = false
-  // settings 注册是服务方法（0.1.2 起）：旧的独立 helper `installSettingsSection`
-  // 已移除。必须在 `ctx.inject(['settings'], ...)` 回调里调用——settings 由兄弟
-  // fiber 提供，且 installSection 要求 owner 是消费者自己的 ctx。
-  ctx.inject(['settings'], (settingsCtx) => {
-    settingsCtx.settings.installSection(ctx, NS, Config, config, {
-      setSource: (source) => { current = source },
-      // 拒绝无法执行的写（非法正则、不成对路由）：throw 使 update/replace 失败，
-      // 运行中的实例保留上一份好配置。
-      validate: (value) => { resolveConfig(value) },
-      onChange: () => {
-        settingsAttached = true
-        resolved = resolveConfig(current())
-        // 配置热更新：重建 tracker（denials 计数与 turn 状态重置）。
-        tracker = new DenialTracker()
-        arm()
-      },
-    })
+  // Register the intent fold unit when the registry service is present
+  // (optional registration, dsh-schedule's pattern): the registration rides
+  // the fiber as an effect, so no manual disposer bookkeeping beyond what
+  // `register` returns.
+  ctx.inject(['sessionProjections'], (projectionCtx) => {
+    projectionCtx.sessionProjections.register(autoApprovalIntentProjection)
   })
+
+  // DSH 0.1.7 volatile settings: the Host commits profile-entry config edits
+  // into the running refs and emits `loader/volatile-update`. Re-resolve the
+  // whole config (refs are the live source; the `paths` argument is ignored —
+  // a full re-resolve is cheap). An invalid update (bad regex, unpaired route,
+  // out-of-range threshold) is rejected here and the previous `resolved`/
+  // armed state stays untouched — invalid config can never silently widen
+  // access.
+  ctx.on('loader/volatile-update', () => {
+    try {
+      const next = resolveConfig(config)
+      resolved = next
+      // Hot config update: rebuild the tracker (per-turn deny count and turn state reset).
+      tracker = new DenialTracker(readTurn)
+      arm()
+    } catch (error: unknown) {
+      logger.warn(`config update rejected, keeping the last good config: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  })
+
+  arm()
 
   // M3：L0 deny 注册为单调 guard——在所有 pre-execute listener 之后执行，
   // 只能 deny 不能 allow，其它 prepend 插件旁路不掉这条硬底线。guard 读
@@ -272,11 +293,11 @@ export function apply(ctx: Context, config: Config = {}): void {
     // ---- L1 classifier（配置后启用；backend: 'llm' 两阶段文本判定 / 'jev' 类型化概率） ----
     if (resolved.classifier !== undefined) {
       const classifier = resolved.classifier
-      const intent = latestUserIntent(agent)
+      const intent = latestUserIntent(ctx, agent)
       // jev backend 不依赖 ctx.llm（直连 HTTP）；llm backend 需要模型服务。
       const llm = classifier.backend === 'llm' ? ctx.get('llm') as LlmLike | undefined : undefined
       if (intent === undefined || (classifier.backend === 'llm' && llm === undefined)) {
-        const detail = intent === undefined ? 'no user message in session log' : 'no ctx.llm service'
+        const detail = intent === undefined ? 'no user intent available (autoApprovalIntent projection absent or empty)' : 'no ctx.llm service'
         auditDecision(ctx, agent, { tool: exec.name, callId, stage: 'L1-fail-closed', decision: 'deny', detail })
         return { kind: 'deny', reason: L1_UNAVAILABLE_REASON }
       }
@@ -334,9 +355,6 @@ export function apply(ctx: Context, config: Config = {}): void {
     auditDecision(ctx, agent, { tool: exec.name, callId, stage: 'L1-unconfigured', decision: 'deny' })
     return { kind: 'deny', reason: L1_UNCONFIGURED_REASON }
   }, { prepend: true })
-
-  // settings 服务缺席（无 inject 回调）时，entry config 已在上面手动 resolve。
-  if (!settingsAttached) arm()
 }
 
 export default apply
