@@ -1,0 +1,42 @@
+{
+  "capturedAt": "2026-09-25",
+  "url": "http://127.0.0.1:3080/",
+  "viewport": { "width": 1256, "height": 808, "devicePixelRatio": 1 },
+  "screenshot": "before-fixed-region.png",
+  "clip": { "x": 270, "y": 350, "width": 260, "height": 240 },
+  "accessButton": {
+    "x": 340,
+    "y": 507,
+    "width": 44,
+    "height": 28,
+    "background": "rgba(255, 255, 255, 0.08)",
+    "color": "rgb(207, 211, 214)",
+    "fontSize": "13px",
+    "borderRadius": "24px",
+    "boxShadow": "rgba(255, 255, 255, 0.16) 0px 0px 0px 2px"
+  },
+  "menu": {
+    "x": 340,
+    "y": 395,
+    "width": 144,
+    "height": 108,
+    "position": "fixed",
+    "zIndex": "1100",
+    "background": "rgba(48, 49, 54, 0.5)",
+    "color": "rgb(249, 250, 251)",
+    "fontSize": "16px",
+    "borderRadius": "16px",
+    "boxShadow": "rgba(255, 255, 255, 0.06) 0px 0px 0px 0.5px, rgba(0, 0, 0, 0.04) 0px 3px 8px 0px, rgba(0, 0, 0, 0.05) 0px 0px 20px 0px"
+  },
+  "menuItems": [
+    { "text": "Read Only", "x": 343, "y": 398, "width": 138, "height": 34 },
+    { "text": "Workspace Write", "x": 343, "y": 432, "width": 138, "height": 34 },
+    { "text": "Full access", "x": 343, "y": 466, "width": 138, "height": 34 }
+  ],
+  "composerStack": {
+    "x": 280,
+    "y": 446,
+    "width": 404,
+    "height": 134
+  }
+}
