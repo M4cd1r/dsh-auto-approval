@@ -96,14 +96,21 @@ function callFacts(exec: ToolExecution): { agent: Agent | undefined; callId: str
  * preset bypasses it entirely. The user-visible model stays 3 + 1: three
  * sandbox tiers plus one fully-managed tier.
  *
- * Since DSH 0.1.7 the configuration is the profile entry's `config` (edited in
- * Settings → Plugins, or by hand in `$DSH_HOME/profiles/web/cordis.patch.yml`):
- * the Host builds the form from this plugin's own Config schema (all fields
- * volatile), commits edits into the running references, and emits
- * `loader/volatile-update` — live, without a remount. Volatile fields reach
- * `apply` as refs; every event re-resolves the whole config, and an invalid
- * update (bad regex, unpaired route, out-of-range threshold) is rejected while
- * the last good config stays armed — access is never silently widened.
+ * Since DSH 0.1.7 the configuration is the profile entry's `config`: edit it
+ * on the GUI — **Settings → Automode** (the browser half's section) or
+ * **Plugins → dsh-auto-approval → Configure** on the official Plugins page —
+ * or by hand in `$DSH_HOME/profiles/web/cordis.patch.yml`. The Host builds the
+ * form from this plugin's own Config schema (all fields volatile), commits
+ * edits into the running references, and emits `loader/volatile-update` —
+ * live, without a remount. Volatile fields reach `apply` as refs; every event
+ * re-resolves the whole config, and an invalid update (bad regex, unpaired
+ * route, out-of-range threshold) is rejected while the last good config stays
+ * armed — access is never silently widened.
+ *
+ * NOTE (09-2026): the entry is only servable while `runtime.Config` survives
+ * the loader's `unwrapExports` — the module must NOT have a `default` export,
+ * because `exports.default ?? exports` would unwrap to the bare `apply`
+ * function and silently drop `Config`, leaving the entry unconfigurable.
  */
 export function apply(ctx: Context, config: ConfigFields = {}): void {
   let resolved: ResolvedConfig = resolveConfig(config)
@@ -357,4 +364,3 @@ export function apply(ctx: Context, config: ConfigFields = {}): void {
   }, { prepend: true })
 }
 
-export default apply

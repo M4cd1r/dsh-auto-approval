@@ -76,7 +76,12 @@ pnpm --dir "$DSH_HOME/profiles/web" up dsh-auto-approval
 
 ## 配置
 
-配置就是本插件的 profile entry——在 Web UI 的 **Settings → Plugins** 里编辑，或直接手改 `$DSH_HOME/profiles/web/cordis.patch.yml`。DSH 0.1.7 起这些字段是 volatile 的：改动热生效到运行中的会话（不重挂载）；非法的在线更新会被拒绝并保留上一份好配置。旧的 `$DSH_HOME/settings.yaml` 会被 DSH 一次性导入后改名：
+配置就是本插件的 profile entry——在 Web UI 里编辑，或直接手改 `$DSH_HOME/profiles/web/cordis.patch.yml`。browser half 自带表单，提供 DSH 0.1.7 配置页的两种入口：
+
+- **Settings → Automode** —— Settings 对话框导航里的一等 section，任何部署都有。
+- **Plugins（侧边栏）→ dsh-auto-approval → Configure** —— 官方 Plugins 页上该行的标准配置页（该页被组合进来时生效）。
+
+DSH 0.1.7 起这些字段是 volatile 的：改动热生效到运行中的会话（不重挂载）；表单暂存全部字段、只在保存时写一次；非法的在线更新会被拒绝并保留上一份好配置（fast provider 缺模型会被宿主拒绝，表单会报告保存失败而不会丢弃草稿）。旧的 `$DSH_HOME/settings.yaml` 会被 DSH 一次性导入后改名：
 
 ```yaml
 - id: auto-approval

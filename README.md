@@ -76,7 +76,12 @@ If your `settings.yaml` has no classifier configured (`classifierFastProvider` /
 
 ## Configuration
 
-Configuration is the plugin's profile entry — edit it through **Settings → Plugins** in the web UI, or by hand in `$DSH_HOME/profiles/web/cordis.patch.yml`. Since DSH 0.1.7 the fields are volatile, so edits apply live to the running session (no remount); an invalid live update is rejected and keeps the last good config. A legacy `$DSH_HOME/settings.yaml` is imported by DSH once and renamed:
+Configuration is the plugin's profile entry — edit it through the GUI or by hand in `$DSH_HOME/profiles/web/cordis.patch.yml`. The browser half ships the form itself, in both places a DSH 0.1.7 configuration page can live:
+
+- **Settings → Automode** — a first-class section in the Settings dialog's nav; present on every deployment.
+- **Plugins (sidebar) → dsh-auto-approval → Configure** — the canonical row page on the official Plugins page, when that page is composed.
+
+Since DSH 0.1.7 the fields are volatile, so edits apply live to the running session (no remount); the form stages every field and writes once on Save, and an invalid live update is rejected and keeps the last good config (a `classifierFastProvider` without its model is refused by the Host, and the form reports the failed save instead of dropping the drafts). A legacy `$DSH_HOME/settings.yaml` is imported by DSH once and renamed:
 
 ```yaml
 - id: auto-approval

@@ -27,6 +27,11 @@ import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 // Type-only: pulls the ui-conversation SlotMap merge (the input.left seat + SessionStandardProps).
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { AutomodeChip } from './AutomodeChip.tsx'
+import {
+  AutomodeSettingsController,
+  AutomodeSettingsPage,
+  AutomodeSettingsSection,
+} from './AutomodeSettingsPage.tsx'
 import type { AutomodeStatus, DecisionRecord } from './remote.ts'
 import { TYPERT_REMOTE } from './remote.ts'
 
@@ -46,11 +51,17 @@ interface AutomodeRemoteNamespace {
   getHistory: (agentId: SessionId) => Promise<RemoteResult<DecisionRecord[]>>
 }
 
-/** Required services: the seat's slot registry, the Client Remote mount, and the locale registry. */
-export const inject = ['slots', 'remote', 'locale']
+/** Required services: the slot registry, the Client Remote mount, the locale registry, and the shared settings forms. */
+export const inject = ['slots', 'remote', 'locale', 'configForms']
 
 /** Locale namespace owning this chip's dictionaries (follows the DSH locale setting). */
 const LOCALE_NS = 'automode'
+
+/** Profile entry id whose volatile fields the configuration page edits (the bundle patch's row id). */
+const ENTRY_NS = 'auto-approval'
+
+/** `plugins.row.config` key: `<bundle package>#<row id>`, as the Plugins page resolves it. */
+const ROW_CONFIG_KEY = 'dsh-auto-approval#auto-approval'
 
 /**
  * Client plugin body: mount the host remote contribution, then register the
@@ -82,4 +93,32 @@ export async function apply(ctx: ClientContext): Promise<void> {
       getHistory: () => statusRemote.getHistory(sessionId),
     }),
   }, AutomodeChip))
+
+  // Configuration page over this entry's volatile fields (the classifier route
+  // pair, backend, guards). One staged form, two homes: a Settings dialog nav
+  // entry that exists on every deployment, and the canonical Configure control
+  // on the official Plugins page (whose slot only exists when that page is
+  // composed). `whileServed` keeps both registrations alive only while the Host
+  // serves the entry, so a deployment without the plugin shows no trace.
+  const t = ctx.locale.bind(LOCALE_NS)
+  const controller = new AutomodeSettingsController(
+    ctx.configForms.get<Record<string, unknown>>(ENTRY_NS),
+  )
+  ctx.effect(() => () => {
+    controller.dispose()
+  }, 'ui-automode: settings form subscription')
+  ctx.effect(() => ctx.configForms.whileServed([ENTRY_NS], () => ctx.slots.inject('settings.section', () => ctx.slots.register({
+    name: 'settings.section',
+    id: 'automode-settings',
+    order: 46,
+    label: () => t('settings.nav'),
+    locale: LOCALE_NS,
+    inject: () => controller.face(),
+  }, AutomodeSettingsSection))), 'ui-automode: settings section')
+  ctx.effect(() => ctx.configForms.whileServed([ENTRY_NS], () => ctx.slots.inject('plugins.row.config', () => ctx.slots.register({
+    name: 'plugins.row.config',
+    key: ROW_CONFIG_KEY,
+    locale: LOCALE_NS,
+    inject: () => controller.face(),
+  }, AutomodeSettingsPage))), 'ui-automode: plugins row config')
 }
